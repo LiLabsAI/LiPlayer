@@ -34,9 +34,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var session: PlayerSession?
     private var playerWindow: NSWindow?
     private var settingsWindow: NSWindow?
+    private var settingsCoordinator = SettingsCoordinator()
     private var keyMonitor: Any?
     private var pendingURLs: [URL] = []
     private var terminating = false
+    private var terminationReplied = false
     private var selfTest: PlaybackSelfTest?
     private var workspaceTest: WorkspaceSelfTest?
     private var sleepObserver: NSObjectProtocol?
@@ -83,10 +85,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         else if !pendingURLs.isEmpty { session.prepareForLaunch(restorePlayback: false); session.open(pendingURLs); pendingURLs = [] }
         else {
-            let paths = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }.map { URL(fileURLWithPath: $0) }
+            let paths = Self.parseLaunchURLs(from: Array(CommandLine.arguments.dropFirst()))
             session.prepareForLaunch(restorePlayback: paths.isEmpty)
             if !paths.isEmpty { session.open(paths) }
         }
+    }
+    private static func parseLaunchURLs(from arguments: [String]) -> [URL] {
+        var result: [URL] = []
+        var index = 0
+        var literalOnly = false
+        let schemes: Set<String> = ["http", "https", "rtsp", "rtmp"]
+        while index < arguments.count {
+            let arg = arguments[index]
+            if !literalOnly && arg == "--" { literalOnly = true; index += 1; continue }
+            if !literalOnly && arg.hasPrefix("-") {
+                // Skip macOS defaults-style `-Flag Value` pairs (e.g. -AppleLanguages, -NS...) when next arg is not a real path/URL.
+                if !arg.hasPrefix("-psn_"), index + 1 < arguments.count {
+                    let next = arguments[index + 1]
+                    let nextIsURL = URL(string: next).flatMap { schemes.contains($0.scheme?.lowercased() ?? "") && $0.host != nil ? $0 : nil } != nil
+                    if !next.hasPrefix("-") && !nextIsURL && !FileManager.default.fileExists(atPath: next) {
+                        index += 2
+                        continue
+                    }
+                }
+                index += 1
+                continue
+            }
+            if let url = URL(string: arg), let scheme = url.scheme?.lowercased(), schemes.contains(scheme), url.host != nil {
+                result.append(url)
+            } else {
+                result.append(URL(fileURLWithPath: arg))
+            }
+            index += 1
+        }
+        return result
     }
     func application(_ sender: NSApplication, open urls: [URL]) { if let session { playerWindow?.makeKeyAndOrderFront(nil); session.open(urls) } else { pendingURLs += urls } }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { playerWindow?.makeKeyAndOrderFront(nil); return true }
@@ -109,9 +141,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         guard let session else { return .terminateNow }
+        let finishTermination: @MainActor () -> Void = { [weak self] in
+            guard let self, !self.terminationReplied else { return }
+            self.terminationReplied = true
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { finishTermination() }
         session.shutdown {
             CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
-                MainActor.assumeIsolated { NSApp.reply(toApplicationShouldTerminate: true) }
+                MainActor.assumeIsolated { finishTermination() }
             }
             CFRunLoopWakeUp(CFRunLoopGetMain())
         }
@@ -149,36 +187,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case .compactPlayer: item.state = session.compact ? .on : .off
         default: break
         }
-        switch command {
-        case .open, .openFolder, .openURL, .addFiles, .toggleLibrary, .toggleQueue, .toggleInspector, .commands, .fullscreen, .alwaysOnTop, .compactPlayer: return true
-        case .saveQueue: return !session.queue.items.isEmpty
-        case .togglePause: return session.currentItem != nil
-        case .next: return session.queue.followingIndex(automatic: false) != nil
-        case .previous: return (session.queue.currentIndex ?? 0) > 0
-        case .backward, .forward, .longBackward, .longForward, .jumpToTime, .loopA, .loopB: return session.loaded && session.seekable
-        default: return session.loaded
-        }
+        return session.canPerform(command)
     }
     @objc func toolbarAction(_ sender: NSToolbarItem) {
         guard let command = PlayerCommand(rawValue: sender.itemIdentifier.rawValue) else { return }
         session?.perform(command)
     }
-    @objc func showSettings(_ sender: Any?) {
+    @objc func showSettings(_ sender: Any?) { presentSettings(tab: "general") }
+    @objc func about(_ sender: Any?) { presentSettings(tab: "about") }
+    private func presentSettings(tab: String) {
         guard let session else { return }
+        settingsCoordinator.selectedTab = tab
+        settingsCoordinator.openNonce &+= 1
         if settingsWindow == nil {
-            let controller = NSHostingController(rootView: SettingsView(session: session))
+            let controller = NSHostingController(rootView: SettingsView(session: session, coordinator: settingsCoordinator))
             let window = NSWindow(contentViewController: controller)
             window.title = "Settings"; window.styleMask = [.titled, .closable]; window.isReleasedWhenClosed = false; window.center()
             settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
-    }
-    @objc func about(_ sender: Any?) {
-        NSApp.orderFrontStandardAboutPanel(options: [
-            .applicationName: "LiPlayer",
-            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development",
-            .credits: NSAttributedString(string: "Copyright © 2026 Ali Ahad · LI Labs\nNative playback with libmpv, FFmpeg and libass.\nGNU General Public License v3.0 (GPLv3) · See Settings → About for source and notices.")
-        ])
     }
     private func buildMenu() {
         let main = NSMenu()
@@ -242,22 +269,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard let session, event.window === playerWindow, !(event.window?.firstResponder is NSTextView), !session.showCommands, !session.showJump else { return event }
         let named: [UInt16: String] = [49: "space", 123: "left", 124: "right", 125: "down", 126: "up", 51: "backspace", 36: "return", 53: "escape"]
         guard let key = named[event.keyCode] ?? event.charactersIgnoringModifiers?.lowercased() else { return event }
-        if key == "escape", session.fullscreen.active { session.perform(.fullscreen); return nil }
         var modifiers: Set<String> = []
         if event.modifierFlags.contains(.command) { modifiers.insert("cmd") }; if event.modifierFlags.contains(.control) { modifiers.insert("ctrl") }; if event.modifierFlags.contains(.option) { modifiers.insert("alt") }; if event.modifierFlags.contains(.shift) { modifiers.insert("shift") }
-        if modifiers.isEmpty, ["left", "right", "up", "down"].contains(key) {
-            var view = event.window?.firstResponder as? NSView
-            while let focused = view {
-                if focused is NSTableView { return event }
-                view = focused.superview
+        let focusedView = event.window?.firstResponder as? NSView
+        if modifiers.isEmpty {
+            if ["left", "right", "up", "down"].contains(key) {
+                var view = focusedView
+                while let current = view {
+                    if current is NSTableView || current is NSSlider || current is NSStepper || current is NSPopUpButton || current is NSSegmentedControl { return event }
+                    view = current.superview
+                }
+            } else if key == "space" {
+                var view = focusedView
+                while let current = view {
+                    if current is NSButton || current is NSPopUpButton || current is NSSegmentedControl { return event }
+                    view = current.superview
+                }
             }
         }
         for command in PlayerCommand.allCases {
             if let shortcut = Shortcut(session.preferences.shortcuts[command.rawValue] ?? command.defaultShortcut), shortcut.key == key, shortcut.modifiers == modifiers {
                 let repeatable: Set<PlayerCommand> = [.backward, .forward, .longBackward, .longForward, .frameForward, .frameBackward, .volumeUp, .volumeDown, .speedUp, .speedDown, .subtitleEarlier, .subtitleLater, .audioEarlier, .audioLater]
                 if event.isARepeat && !repeatable.contains(command) { return nil }
-                session.perform(command); return nil
+                session.fullscreen.clearKeyboardNavigation()
+                if session.canPerform(command) { session.perform(command) }
+                return nil
             }
+        }
+        if key == "escape", modifiers.isEmpty, session.fullscreen.active {
+            session.perform(.fullscreen)
+            return nil
         }
         return event
     }

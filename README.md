@@ -13,7 +13,7 @@ The current bundle targets **Apple Silicon running macOS 27.2 or later**, matchi
 
 ## Use the app
 
-Download the Apple Silicon app from [GitHub Releases](https://github.com/LiLabsAI/LiPlayer/releases/tag/v0.2.1) (released prior to the rename as `Video Player.app`) or build `LiPlayer.app` from source below, and move it into Applications. Open a file with ⌘O or open a persistent folder Library with ⌘⇧O. Show/hide Library with ⌘⇧L. Quit earlier builds before opening another copy.
+Download the Apple Silicon app from [GitHub Releases](https://github.com/LiLabsAI/LiPlayer/releases/latest) or build `LiPlayer.app` from source below, and move it into Applications. Open a file with ⌘O or open a persistent folder Library with ⌘⇧O. Show/hide Library with ⌘⇧L. Quit earlier builds before opening another copy.
 
 **Signing:** this build is ad hoc signed and is not notarized. macOS may block a downloaded copy. A Developer ID signed release is future work; building from source is available below. No automatic updater is included.
 
@@ -52,7 +52,7 @@ python3 scripts/verify-workspace.py
 
 Fixture generation requires FFmpeg with x264, x265, VP9 and SVT-AV1 encoders. Tests use generated media, loopback HTTP and untrusted HTTPS servers, and isolated QA data. Add `--https-url <direct-media-url>` to test a trusted online stream. Use `--app <bundle-path>` to verify a particular release bundle. The real playback report is saved to [docs/validation/playback.json](docs/validation/playback.json); assertion failures return a failure status.
 
-See the [usage guide](docs/usage.md), [architecture](docs/architecture.md), [validation notes](docs/validation.md), and [completion audit](docs/completion-audit.md).
+See the [usage guide](docs/usage.md), [architecture](docs/architecture.md), [validation notes](docs/validation.md), and [v0.1.0 completion audit](docs/completion-audit.md).
 
 ## Current boundaries
 

@@ -52,13 +52,41 @@ nonisolated enum EngineEvent: Sendable {
     case property(String, EngineValue), refreshed(UUID, String, EngineValue), registered(Int64, UUID), loadFailed(UUID, String), started(Int64), loaded, restarted, screenshotWritten(String), ended(Int64, Int32, String?), error(String)
 }
 
+// Coalesces mpv wakeup callbacks onto the engine's serial queue without retaining PlaybackEngine.
+private nonisolated final class WakeupBridge: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var engine: PlaybackEngine?
+    private var scheduled = false
+    init(_ engine: PlaybackEngine) { self.engine = engine }
+    func invalidate() {
+        lock.lock()
+        engine = nil
+        scheduled = false
+        lock.unlock()
+    }
+    func trigger() {
+        lock.lock()
+        guard !scheduled, let engine else { lock.unlock(); return }
+        scheduled = true
+        lock.unlock()
+        engine.scheduleDrain()
+    }
+    func beginDrain() {
+        lock.lock()
+        scheduled = false
+        lock.unlock()
+    }
+}
+
 // The C handle is thread-safe; all control/event access is serialized on queue.
 // The render API has its own independent serial queue and is released first.
 nonisolated final class PlaybackEngine: @unchecked Sendable {
     let handle: OpaquePointer
+    let mpvVersion: String
     private let queue = DispatchQueue(label: "app.liplayer.engine", qos: .userInitiated)
     private let logger = Logger(subsystem: "com.aliahad.liplayer", category: "playback")
-    private var timer: DispatchSourceTimer?
+    private var wakeupBridge: WakeupBridge?
+    private var wakeupContext: UnsafeMutableRawPointer?
     private var stopped = false
     private var requestID: UInt64 = 0
     private var requests: [UInt64: String] = [:]
@@ -74,18 +102,62 @@ nonisolated final class PlaybackEngine: @unchecked Sendable {
         self.handle = handle
         self.receive = receive
         // The bundled OpenSSL must use the system CA file rather than its Homebrew build prefix.
-        let options = ["config": "no", "terminal": "no", "vo": "libmpv", "hwdec": "videotoolbox", "idle": "yes", "keep-open": "no", "input-default-bindings": "no", "input-vo-keyboard": "no", "osd-level": "0", "load-scripts": "no", "ytdl": "no", "sub-auto": "exact", "audio-file-auto": "exact", "audio-pitch-correction": "yes", "screenshot-format": "png", "target-colorspace-hint": "no", "target-trc": "srgb", "target-prim": "bt.709", "tls-verify": "yes", "tls-ca-file": "/etc/ssl/cert.pem"]
-        for (name, value) in options { mpv_set_option_string(handle, name, value) }
+        let options: [(String, String, Bool)] = [
+            ("config", "no", true), ("terminal", "no", false), ("vo", "libmpv", true),
+            ("hwdec", "videotoolbox", false), ("idle", "yes", true), ("keep-open", "no", false),
+            ("input-default-bindings", "no", false), ("input-vo-keyboard", "no", false),
+            ("osd-level", "0", false), ("load-scripts", "no", false), ("ytdl", "no", false),
+            ("sub-auto", "exact", false), ("audio-file-auto", "exact", false),
+            ("audio-pitch-correction", "yes", false), ("screenshot-format", "png", false),
+            ("target-colorspace-hint", "no", false), ("target-trc", "srgb", false),
+            ("target-prim", "bt.709", false), ("tls-verify", "yes", true),
+            ("tls-ca-file", "/etc/ssl/cert.pem", true)
+        ]
+        for (name, value, required) in options {
+            let rc = mpv_set_option_string(handle, name, value)
+            if rc < 0 {
+                let reason = String(cString: mpv_error_string(rc))
+                if required {
+                    mpv_terminate_destroy(handle)
+                    throw EngineError.message("Could not configure engine option '\(name)': \(reason)")
+                }
+                logger.warning("Failed to set mpv option \(name, privacy: .public)=\(value, privacy: .public): \(reason, privacy: .public)")
+            }
+        }
         let status = mpv_initialize(handle)
         guard status >= 0 else { mpv_terminate_destroy(handle); throw EngineError.message(String(cString: mpv_error_string(status))) }
+        if let raw = mpv_get_property_string(handle, "mpv-version") {
+            let text = String(cString: raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            mpv_free(raw)
+            if text.hasPrefix("mpv v") { mpvVersion = "libmpv " + text.dropFirst(5) }
+            else if text.hasPrefix("mpv ") { mpvVersion = "libmpv " + text.dropFirst(4) }
+            else { mpvVersion = text.isEmpty ? "libmpv" : "libmpv \(text)" }
+        } else {
+            mpvVersion = "libmpv"
+        }
         let properties = ["time-pos", "duration", "pause", "volume", "mute", "speed", "track-list", "chapter-list", "aid", "sid", "secondary-sid", "chapter", "audio-delay", "sub-delay", "sub-scale", "sub-pos", "brightness", "contrast", "saturation", "gamma", "video-zoom", "video-pan-x", "video-pan-y", "video-rotate", "video-aspect-override", "deinterlace", "hwdec-current", "video-codec", "audio-codec-name", "video-params", "video-out-params", "decoder-frame-drop-count", "frame-drop-count", "estimated-vf-fps", "demuxer-cache-state", "paused-for-cache", "seekable", "media-title", "path", "ab-loop-a", "ab-loop-b", "audio-device-list", "audio-device", "audio-params", "eof-reached", "seeking", "sub-text"]
         observedProperties = properties
-        for (index, name) in properties.enumerated() { mpv_observe_property(handle, UInt64(index + 1), name, MPV_FORMAT_NODE) }
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(25))
-        timer.setEventHandler { [weak self] in self?.drain() }
-        self.timer = timer
-        timer.resume()
+        for (index, name) in properties.enumerated() {
+            let rc = mpv_observe_property(handle, UInt64(index + 1), name, MPV_FORMAT_NODE)
+            if rc < 0 { logger.warning("Could not observe mpv property \(name, privacy: .public): \(String(cString: mpv_error_string(rc)), privacy: .public)") }
+        }
+        let bridge = WakeupBridge(self)
+        wakeupBridge = bridge
+        let pointer = Unmanaged.passRetained(bridge).toOpaque()
+        wakeupContext = pointer
+        mpv_set_wakeup_callback(handle, { context in
+            guard let context else { return }
+            Unmanaged<WakeupBridge>.fromOpaque(context).takeUnretainedValue().trigger()
+        }, pointer)
+        scheduleDrain()
+    }
+
+    fileprivate func scheduleDrain() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.wakeupBridge?.beginDrain()
+            self.drain()
+        }
     }
 
     func command(_ arguments: [String], itemID: UUID? = nil) {
@@ -94,6 +166,10 @@ nonisolated final class PlaybackEngine: @unchecked Sendable {
             requestID &+= 1
             let strings = arguments.map { strdup($0) }
             defer { strings.forEach { free($0) } }
+            guard strings.allSatisfy({ $0 != nil }) else {
+                receive([itemID.map { .loadFailed($0, "Memory allocation failed for command.") } ?? .error("Memory allocation failed for command.")])
+                return
+            }
             var pointers: [UnsafePointer<CChar>?] = strings.map { pointer in pointer.map { UnsafePointer<CChar>($0) } } + [nil]
             let status = mpv_command_async(handle, requestID, &pointers)
             if status < 0 {
@@ -117,7 +193,10 @@ nonisolated final class PlaybackEngine: @unchecked Sendable {
     }
     func set(_ name: String, _ value: String) { command(["set", name, value]) }
     static func normalized(_ name: String, _ value: Double) -> Double {
-        ["brightness", "contrast", "saturation", "gamma", "video-rotate"].contains(name) ? value.rounded() : value
+        if ["brightness", "contrast", "saturation", "gamma", "video-rotate"].contains(name) { return value.rounded() }
+        if name == "speed" { return (value * 100).rounded() / 100 }
+        if name == "sub-delay" || name == "audio-delay" { return (value * 1000).rounded() / 1000 }
+        return value
     }
     func set(_ name: String, _ value: Double) {
         let value = Self.normalized(name, value)
@@ -183,9 +262,16 @@ nonisolated final class PlaybackEngine: @unchecked Sendable {
         queue.async { [self] in
             guard !stopped else { completion(); return }
             stopped = true
-            timer?.cancel(); timer = nil
+            wakeupBridge?.invalidate()
+            mpv_set_wakeup_callback(handle, nil, nil)
             reads.values.forEach { $0(.none) }; reads.removeAll()
+            requests.removeAll(); screenshotRequests.removeAll(); loadRequests.removeAll(); propertyRequests.removeAll()
             mpv_terminate_destroy(handle)
+            if let pointer = wakeupContext {
+                wakeupContext = nil
+                Unmanaged<WakeupBridge>.fromOpaque(pointer).release()
+            }
+            wakeupBridge = nil
             logger.info("Playback engine stopped")
             completion()
         }

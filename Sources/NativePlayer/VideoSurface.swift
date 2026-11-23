@@ -28,13 +28,16 @@ nonisolated final class GLRenderer: @unchecked Sendable {
     private var render: OpaquePointer?
     private var width: Int32 = 1
     private var height: Int32 = 1
+    private var stopped = false
     private var retainedContext: UnsafeMutableRawPointer?
 
     init(engine: PlaybackEngine, context: CGLContextObj) throws {
+        CGLRetainContext(context)
         self.context = context
         var failure: Int32 = 0
         queue.sync {
-            CGLLockContext(context); defer { CGLUnlockContext(context) }
+            CGLLockContext(context)
+            defer { CGLSetCurrentContext(nil); CGLUnlockContext(context) }
             CGLSetCurrentContext(context)
             var initParams = mpv_opengl_init_params(get_proc_address: { _, name in
                 guard let name else { return nil }
@@ -47,20 +50,31 @@ nonisolated final class GLRenderer: @unchecked Sendable {
                 }
             }
         }
-        guard failure >= 0 else { throw EngineError.message("Could not initialize video rendering: \(String(cString: mpv_error_string(failure)))") }
+        guard failure >= 0 else {
+            CGLReleaseContext(context)
+            throw EngineError.message("Could not initialize video rendering: \(String(cString: mpv_error_string(failure)))")
+        }
         retainedContext = Unmanaged.passRetained(self).toOpaque()
         mpv_render_context_set_update_callback(render, { pointer in
             guard let pointer else { return }
             Unmanaged<GLRenderer>.fromOpaque(pointer).takeUnretainedValue().draw()
         }, retainedContext)
     }
+    deinit {
+        CGLReleaseContext(context)
+    }
     func resize(width: Int32, height: Int32) {
-        queue.async { [self] in self.width = max(1, width); self.height = max(1, height); renderFrame() }
+        queue.async { [self] in
+            guard !stopped else { return }
+            self.width = max(1, width); self.height = max(1, height)
+            renderFrame()
+        }
     }
     func draw() { queue.async { [self] in renderFrame() } }
     private func renderFrame() {
-        guard let render else { return }
-        CGLLockContext(context); defer { CGLUnlockContext(context) }
+        guard !stopped, let render else { return }
+        CGLLockContext(context)
+        defer { CGLSetCurrentContext(nil); CGLUnlockContext(context) }
         CGLSetCurrentContext(context)
         _ = mpv_render_context_update(render)
         var fbo = mpv_opengl_fbo(fbo: 0, w: width, h: height, internal_format: 0)
@@ -79,8 +93,11 @@ nonisolated final class GLRenderer: @unchecked Sendable {
     }
     func stop() {
         queue.sync {
+            guard !stopped else { return }
+            stopped = true
             guard let render else { return }
-            CGLLockContext(context); defer { CGLUnlockContext(context) }
+            CGLLockContext(context)
+            defer { CGLSetCurrentContext(nil); CGLUnlockContext(context) }
             CGLSetCurrentContext(context)
             mpv_render_context_set_update_callback(render, nil, nil)
             mpv_render_context_free(render)
@@ -93,6 +110,7 @@ nonisolated final class GLRenderer: @unchecked Sendable {
 final class VideoOpenGLView: NSOpenGLView {
     let session: PlayerSession
     var renderer: GLRenderer?
+    private var clickTask: Task<Void, Never>?
     init?(session: PlayerSession) {
         self.session = session
         let attributes: [NSOpenGLPixelFormatAttribute] = [UInt32(NSOpenGLPFAOpenGLProfile), UInt32(NSOpenGLProfileVersion3_2Core), UInt32(NSOpenGLPFADoubleBuffer), UInt32(NSOpenGLPFAAccelerated), UInt32(NSOpenGLPFAColorSize), 24, UInt32(NSOpenGLPFAAlphaSize), 8, 0]
@@ -103,6 +121,10 @@ final class VideoOpenGLView: NSOpenGLView {
         registerForDraggedTypes([.fileURL, .URL])
     }
     required init?(coder: NSCoder) { nil }
+    func clearRenderer() {
+        clickTask?.cancel(); clickTask = nil
+        renderer?.stop(); renderer = nil
+    }
     override var acceptsFirstResponder: Bool { true }
     override func prepareOpenGL() {
         super.prepareOpenGL()
@@ -123,16 +145,36 @@ final class VideoOpenGLView: NSOpenGLView {
     override func draw(_ dirtyRect: NSRect) { renderer?.draw() }
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        if event.clickCount == 2 { session.perform(.fullscreen) }
-        else { session.perform(.togglePause) }
+        if event.clickCount == 2 {
+            clickTask?.cancel(); clickTask = nil
+            session.perform(.fullscreen)
+        } else if event.clickCount == 1 {
+            clickTask?.cancel()
+            let delay = NSEvent.doubleClickInterval
+            clickTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled, let self else { return }
+                self.clickTask = nil
+                self.session.perform(.togglePause)
+            }
+        }
     }
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
-        for command in [PlayerCommand.togglePause, .attachSubtitle, .screenshot, .toggleInspector, .toggleQueue, .fullscreen] {
-            let item = NSMenuItem(title: command.title, action: #selector(AppDelegate.commandAction(_:)), keyEquivalent: "")
-            item.representedObject = command.rawValue; item.target = NSApp.delegate
-            menu.addItem(item)
+        func addCommands(_ commands: [PlayerCommand]) {
+            for command in commands {
+                let item = NSMenuItem(title: command.title, action: #selector(AppDelegate.commandAction(_:)), keyEquivalent: "")
+                item.representedObject = command.rawValue; item.target = NSApp.delegate
+                menu.addItem(item)
+            }
         }
+        addCommands([.togglePause, .open, .openFolder])
+        menu.addItem(.separator())
+        addCommands([.attachSubtitle, .screenshot, .resetAdjustments])
+        menu.addItem(.separator())
+        addCommands([.toggleLibrary, .toggleQueue, .toggleInspector])
+        menu.addItem(.separator())
+        addCommands([.fullscreen, .compactPlayer, .alwaysOnTop])
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation { .copy }

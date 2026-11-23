@@ -27,7 +27,12 @@ public struct MediaItem: Identifiable, Codable, Equatable, Sendable {
         self.url = url.isFileURL ? url.standardizedFileURL : url
         self.bookmark = bookmark
     }
-    public var title: String { url.isFileURL ? url.lastPathComponent : (url.host ?? url.absoluteString) }
+    public var title: String {
+        if url.isFileURL { return url.lastPathComponent }
+        let name = url.lastPathComponent
+        if !name.isEmpty, name != "/" { return name }
+        return url.host ?? url.absoluteString
+    }
 }
 
 public enum RepeatMode: String, Codable, CaseIterable, Sendable {
@@ -90,26 +95,40 @@ public struct PlaybackQueue: Sendable {
 }
 
 public enum MediaFiles {
-    public static let videoExtensions: Set<String> = ["mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "ts", "m2ts", "mts", "mpeg", "mpg", "vob", "ogv", "3gp", "mxf", "y4m"]
-    public static let audioExtensions: Set<String> = ["mp3", "m4a", "aac", "flac", "wav", "aiff", "aif", "ogg", "opus", "wma", "ape", "alac", "mka"]
+    public static let videoExtensions: Set<String> = ["mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "f4v", "ts", "m2ts", "mts", "mpeg", "mpg", "vob", "ogv", "3gp", "mxf", "y4m", "asf", "rm", "rmvb", "divx", "dv", "wtv"]
+    public static let audioExtensions: Set<String> = ["mp3", "m4a", "m4b", "aac", "flac", "wav", "aiff", "aif", "ogg", "opus", "wma", "ape", "alac", "mka", "caf", "wv", "ac3", "dts", "eac3"]
     public static let subtitleExtensions: Set<String> = ["srt", "ass", "ssa", "vtt", "sub", "idx", "sup", "smi", "sami", "lrc"]
+    public static let playlistExtensions: Set<String> = ["lpqueue", "vpqueue", "m3u", "m3u8"]
+    public static var allOpenableExtensions: Set<String> { videoExtensions.union(audioExtensions).union(subtitleExtensions).union(playlistExtensions) }
     public static func isSubtitle(_ url: URL) -> Bool { subtitleExtensions.contains(url.pathExtension.lowercased()) }
     public static func isMedia(_ url: URL) -> Bool { videoExtensions.union(audioExtensions).contains(url.pathExtension.lowercased()) }
+    public static func isSupportedFile(_ url: URL) -> Bool { !url.isFileURL || allOpenableExtensions.contains(url.pathExtension.lowercased()) }
     public static func naturallySorted(_ urls: [URL]) -> [URL] {
-        urls.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        urls.sorted {
+            let order = $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent)
+            return order == .orderedSame ? $0.path < $1.path : order == .orderedAscending
+        }
     }
     // Only immediate children of explicitly selected folders are enumerated.
     @concurrent public static func expand(_ urls: [URL]) async throws -> [URL] {
         var result: [URL] = []
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isPackageKey, .isSymbolicLinkKey]
         for url in urls {
             try Task.checkCancellation()
             guard url.isFileURL else { result.append(url); continue }
-            let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+            let values = try url.resourceValues(forKeys: keys)
+            if values.isPackage == true { continue }
             if values.isDirectory == true {
-                let children = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
-                result += naturallySorted(children.filter { isMedia($0) && (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true })
+                let children = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles])
+                result += naturallySorted(children.filter {
+                    guard let childValues = try? $0.resourceValues(forKeys: keys),
+                          childValues.isSymbolicLink != true,
+                          childValues.isPackage != true,
+                          childValues.isRegularFile == true else { return false }
+                    return isMedia($0)
+                })
             } else if let entries = try Playlist.read(url) { result += entries }
-            else { result.append(url) }
+            else if isSupportedFile(url) { result.append(url) }
         }
         return result
     }
@@ -123,8 +142,19 @@ public enum TimeText {
         return value >= 3600 ? String(format: "%@%d:%02d:%02d", sign, value / 3600, value / 60 % 60, value % 60) : String(format: "%@%d:%02d", sign, value / 60, value % 60)
     }
     public static func parse(_ text: String) -> Double? {
-        let parts = text.trimmingCharacters(in: .whitespaces).split(separator: ":", omittingEmptySubsequences: false)
+        let parts = text.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ":", omittingEmptySubsequences: false).map(String.init)
         guard (1...3).contains(parts.count), parts.allSatisfy({ !$0.isEmpty }) else { return nil }
+        func isDigits(_ s: String) -> Bool { !s.isEmpty && s.allSatisfy(\.isASCII) && s.allSatisfy(\.isNumber) }
+        func isDecimal(_ s: String) -> Bool {
+            let halves = s.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+            if halves.count == 1 { return isDigits(halves[0]) }
+            if halves.count == 2 { return isDigits(halves[0]) && isDigits(halves[1]) }
+            return false
+        }
+        for (index, part) in parts.enumerated() {
+            let validPart = index == parts.count - 1 ? isDecimal(part) : isDigits(part)
+            guard validPart else { return nil }
+        }
         let numbers = parts.compactMap { Double($0) }
         guard numbers.count == parts.count, numbers.allSatisfy({ $0.isFinite && $0 >= 0 }) else { return nil }
         if numbers.count > 1 && numbers.dropFirst().contains(where: { $0 >= 60 }) { return nil }

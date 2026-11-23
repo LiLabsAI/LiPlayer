@@ -53,8 +53,9 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     var phase = "Ready"
     var errorMessage: String?
     var notice: String?
+    var hudMessage: String?
     private enum Sidebar: String { case queue, inspector }
-    private var sidebar: Sidebar? { didSet { saveWorkspace() } }
+    private var sidebar: Sidebar? { didSet { if !compact { saveWorkspace() } } }
     var showQueue: Bool {
         get { (fullscreen.active ? fullscreenSidebar : sidebar) == .queue }
         set {
@@ -75,6 +76,7 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     var compact = false
     private var normalFrame: NSRect?
     private var normalFloating = false
+    private var normalSidebar: Sidebar?
     var preferences: Preferences
     var history: [ResumeRecord]
     var engine: PlaybackEngine?
@@ -95,7 +97,13 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     private var workspaceSpeed = 1.0
     private var pendingWorkspacePosition: Double?
     private var startupResumeTarget: Double?
+    private var startupSeekPending = false
+    private var startupSeekFallbackTask: Task<Void, Never>?
+    private var preserveNextLoadAdjustments = false
     private var pendingLibraryNotice: String?
+    private var noticeTask: Task<Void, Never>?
+    private var hudTask: Task<Void, Never>?
+    private var volumeSaveTask: Task<Void, Never>?
     private var activeEntry: Int64?
     private var activeLoadID: UUID?
     private var currentLoadID = UUID()
@@ -103,7 +111,7 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     private var deferredLoadedEntry: Int64?
     private var pendingRestore: ResumeRecord?
     private var openTask: Task<Void, Never>?
-    private var scopes: [URL] = []
+    private var scopes: Set<URL> = []
     private var lastHistoryWrite = Date.distantPast
     private var lastSystemPlaybackUpdate = Date.distantPast
     private var powerAssertion: IOPMAssertionID = 0
@@ -111,17 +119,19 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     private var openingID = UUID()
     var playbackRevision = 0
     var preventsDisplaySleep: Bool { powerAssertion != 0 }
+    var engineVersion: String { engine?.mpvVersion ?? "libmpv" }
     private let globalProperties: Set<String> = ["pause", "volume", "mute", "audio-device-list", "audio-device"]
 
     init(directory explicitDirectory: URL? = nil) {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         let directory = explicitDirectory ?? appSupport.appendingPathComponent("LiPlayer")
         if explicitDirectory == nil {
             DiskStore.migrateIfNeeded(from: appSupport.appendingPathComponent("VideoPlayer"), to: directory)
         }
         store = DiskStore(directory: directory)
         workspaceWriter = WorkspaceWriter(directory: directory)
-        let settings = store.read(Preferences.self, name: "preferences.json") ?? Preferences()
+        var settings = store.read(Preferences.self, name: "preferences.json") ?? Preferences()
+        settings.sanitize()
         preferences = settings
         history = store.read([ResumeRecord].self, name: "history.json") ?? []
         if !settings.rememberHistory { history = [] }
@@ -153,6 +163,7 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         library.changed = { [weak self] in self?.saveWorkspace() }
         library.reportError = { [weak self] in self?.errorMessage = $0 }
         library.relocated = { [weak self] previous, next in self?.relocateWorkspace(from: previous, to: next) }
+        library.removedRoot = { [weak self] url in self?.releaseAccess(to: url) }
         workspaceSaveError = restorationError
         workspaceReady = true
         fullscreen.canHide = { [weak self] in
@@ -175,6 +186,45 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     var chapters: [Chapter] { (values["chapter-list"]?.array ?? []).enumerated().map { Chapter(id: $0.offset, title: $0.element["title"].string.isEmpty ? "Chapter \($0.offset + 1)" : $0.element["title"].string, time: $0.element["time"].number) } }
     func finite(_ key: String) -> Double { let value = values[key]?.number ?? 0; return value.isFinite ? value : 0 }
     func shortcut(_ command: PlayerCommand) -> String { Shortcut(preferences.shortcuts[command.rawValue] ?? command.defaultShortcut)?.display ?? "" }
+    func canPerform(_ command: PlayerCommand) -> Bool {
+        switch command {
+        case .open, .openFolder, .openURL, .addFiles, .toggleLibrary, .toggleQueue, .toggleInspector, .commands, .fullscreen, .alwaysOnTop, .compactPlayer: return true
+        case .saveQueue: return !queue.items.isEmpty
+        case .togglePause: return currentItem != nil
+        case .next: return queue.followingIndex(automatic: false) != nil
+        case .previous: return (queue.currentIndex ?? 0) > 0
+        case .backward, .forward, .longBackward, .longForward, .jumpToTime, .loopA, .loopB: return loaded && seekable
+        case .volumeUp, .volumeDown, .mute: return true
+        default: return loaded
+        }
+    }
+    func showNotice(_ text: String, autoDismiss: Bool = true, duration seconds: Double = 4.0) {
+        noticeTask?.cancel()
+        notice = text
+        guard autoDismiss else { return }
+        noticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled, let self, self.notice == text else { return }
+            self.notice = nil
+        }
+    }
+    func showHUD(_ text: String) {
+        hudTask?.cancel()
+        hudMessage = text
+        hudTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1100))
+            guard !Task.isCancelled, let self, self.hudMessage == text else { return }
+            self.hudMessage = nil
+        }
+    }
+    private func scheduleVolumeSave() {
+        volumeSaveTask?.cancel()
+        volumeSaveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self, !self.closing else { return }
+            try? self.store.write(self.preferences, name: "preferences.json")
+        }
+    }
 
     func applyPreferences() {
         engine?.set("volume", min(100, max(0, preferences.volume)))
@@ -211,6 +261,15 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         panel.canChooseDirectories = folder
         panel.canChooseFiles = !folder
         panel.allowsMultipleSelection = !subtitle
+        if subtitle {
+            panel.allowedContentTypes = MediaFiles.subtitleExtensions.compactMap { UTType(filenameExtension: $0) }
+        } else if !folder {
+            var types: [UTType] = [.movie, .audio, UTType(exportedAs: "com.aliahad.liplayer.queue", conformingTo: .json), UTType(importedAs: "com.aliahad.videoplayer.queue", conformingTo: .json)]
+            for ext in MediaFiles.allOpenableExtensions {
+                if let type = UTType(filenameExtension: ext), !types.contains(type) { types.append(type) }
+            }
+            panel.allowedContentTypes = types
+        }
         panel.message = subtitle ? "Choose a subtitle file to attach to the current video." : folder ? "Add folders to your saved library. Expand subfolders to browse their videos." : "Choose media files."
         panel.prompt = append ? "Add" : "Open"
         guard panel.runModal() == .OK else { return }
@@ -243,10 +302,18 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
                 if files.isEmpty { return }
                 let subtitles = expanded.filter(MediaFiles.isSubtitle)
                 let items = expanded.filter { !MediaFiles.isSubtitle($0) }.map { url in MediaItem(url: url, bookmark: url.isFileURL ? try? url.bookmarkData(options: .withSecurityScope) : nil) }
-                guard !items.isEmpty else { self.errorMessage = "No supported media files were found in this folder."; return }
+                guard !items.isEmpty else { self.errorMessage = "No supported media files were found."; return }
                 self.saveProgress()
                 if !append { self.pendingSubtitles.removeAll() }
-                if !subtitles.isEmpty { self.pendingSubtitles[items[0].id] = subtitles }
+                if !subtitles.isEmpty {
+                    var matched: [UUID: [URL]] = [:]
+                    for sub in subtitles {
+                        let stem = sub.deletingPathExtension().lastPathComponent.lowercased()
+                        let owner = items.first(where: { $0.url.deletingPathExtension().lastPathComponent.lowercased() == stem }) ?? items[0]
+                        matched[owner.id, default: []].append(sub)
+                    }
+                    for (id, list) in matched { self.pendingSubtitles[id, default: []].append(contentsOf: list) }
+                }
                 if append {
                     let wasEmpty = self.queue.items.isEmpty
                     self.queue.append(items)
@@ -267,16 +334,22 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         open([url])
     }
     func select(_ item: MediaItem) { saveProgress(); guard queue.select(item.id) else { return }; load(item) }
-    private func load(_ item: MediaItem, paused: Bool = false, restore: ResumeRecord? = nil, startupRestore: Bool = false) {
+    private func load(_ item: MediaItem, paused: Bool = false, restore: ResumeRecord? = nil, startupRestore: Bool = false, preserveAdjustments: Bool = false) {
+        startupSeekFallbackTask?.cancel(); startupSeekFallbackTask = nil
+        noticeTask?.cancel()
         currentLoadID = UUID()
+        preserveNextLoadAdjustments = preserveAdjustments
         currentItem = item; loaded = false; phase = "Opening…"; errorMessage = nil; notice = nil
-        if !startupRestore { workspaceSpeed = 1 }
+        if !startupRestore && !preserveAdjustments { workspaceSpeed = 1 }
         values = values.filter { globalProperties.contains($0.key) }
-        pendingRestore = preferences.rememberHistory ? (restore ?? history.first { $0.url == item.url }) : nil
-        pendingWorkspacePosition = restore.flatMap { $0.position.isFinite && $0.position >= 0 && $0.duration.isFinite && $0.duration > 0 && $0.position < $0.duration - 0.25 ? $0.position : nil }
-        startupResumeTarget = startupRestore ? pendingWorkspacePosition ?? 0 : nil
+        values["pause"] = .flag(paused)
+        pendingRestore = preserveAdjustments ? nil : (preferences.rememberHistory ? (restore ?? history.first { $0.url == item.url }) : nil)
+        pendingWorkspacePosition = preserveAdjustments ? nil : restore.flatMap { $0.position.isFinite && $0.position >= 0 && $0.duration.isFinite && $0.duration > 0 && $0.position < $0.duration - 0.25 ? $0.position : nil }
+        let willSeekOnStartup = startupRestore && preferences.resumePlayback && (pendingWorkspacePosition ?? 0) > 0
+        startupResumeTarget = willSeekOnStartup ? pendingWorkspacePosition : nil
+        startupSeekPending = willSeekOnStartup
         if item.url.isFileURL {
-            if let folder = library.folders.first(where: { item.url.path.hasPrefix($0.url.path + "/") }) { retainAccess(to: folder.url) }
+            if let folder = library.folders.first(where: { LibraryLocation.contains(item.url, inside: $0.url) }) { retainAccess(to: folder.url) }
             else { retainAccess(to: item.url) }
         }
         engine?.command(["loadfile", item.url.isFileURL ? item.url.path : item.url.absoluteString, "replace"], itemID: currentLoadID)
@@ -295,25 +368,59 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         if current { saveProgress() }
         queue.remove(item.id)
         pendingSubtitles.removeValue(forKey: item.id)
-        if current { if let next = queue.current { load(next) } else { stop() } }
+        if item.url.isFileURL, !library.folders.contains(where: { LibraryLocation.contains(item.url, inside: $0.url) }), !queue.items.contains(where: { $0.url == item.url }) {
+            releaseAccess(to: item.url)
+        }
+        if current { if let next = queue.current { load(next) } else { stop(); currentItem = nil; phase = "Ready"; window?.title = "LiPlayer" } }
+    }
+    func clearQueue() {
+        saveProgress()
+        let oldURLs = queue.items.map(\.url)
+        pendingSubtitles.removeAll()
+        queue.replace([])
+        engine?.command(["stop"])
+        loaded = false; currentItem = nil; phase = "Ready"; window?.title = "LiPlayer"
+        for url in oldURLs where url.isFileURL && !library.folders.contains(where: { LibraryLocation.contains(url, inside: $0.url) }) {
+            releaseAccess(to: url)
+        }
+        updateSystemPlayback(); saveWorkspace()
+    }
+    func moveQueueItems(fromOffsets offsets: IndexSet, toOffset destination: Int) {
+        var reordered = queue.items
+        let moving = offsets.map { reordered[$0] }
+        let removedBefore = offsets.filter { $0 < destination }.count
+        for index in offsets.sorted(by: >) { reordered.remove(at: index) }
+        let insertionIndex = max(0, min(reordered.count, destination - removedBefore))
+        reordered.insert(contentsOf: moving, at: insertionIndex)
+        let selected = queue.currentID
+        queue.replace(reordered)
+        if let selected { queue.select(selected) }
     }
     func next(automatic: Bool = false) { saveProgress(); if let item = queue.next(automatic: automatic) { load(item) } }
     func previous() { saveProgress(); if let item = queue.previous() { load(item) } }
     func stop() { saveProgress(); engine?.command(["stop"]); loaded = false; phase = "Stopped"; updateSystemPlayback(); saveWorkspace() }
     func seek(_ seconds: Double) {
         guard loaded, seekable, seconds.isFinite else { return }
+        startupResumeTarget = nil; startupSeekPending = false; startupSeekFallbackTask?.cancel()
         engine?.command(["seek", String(max(0, min(seconds, duration > 0 ? duration : seconds))), "absolute+exact"])
     }
     func set(_ name: String, _ value: Double) {
         guard value.isFinite else { return }
-        let value = PlaybackEngine.normalized(name, value)
-        values[name] = .number(value)
-        if name == "speed" { workspaceSpeed = min(4, max(0.25, value)) }
-        if name == "volume" { preferences.volume = value }
-        engine?.set(name, value)
+        var normalized = PlaybackEngine.normalized(name, value)
+        if name == "volume" { normalized = min(100, max(0, normalized)) }
+        else if name == "speed" { normalized = min(4, max(0.25, normalized)) }
+        else if name == "sub-delay" || name == "audio-delay" { normalized = min(60, max(-60, normalized)) }
+        values[name] = .number(normalized)
+        if name == "speed" { workspaceSpeed = normalized }
+        if name == "volume" { preferences.volume = normalized; scheduleVolumeSave() }
+        engine?.set(name, normalized)
     }
     func set(_ name: String, _ value: Bool) { values[name] = .flag(value); engine?.set(name, value) }
-    func set(_ name: String, _ value: String) { values[name] = .string(value); engine?.set(name, value) }
+    func set(_ name: String, _ value: String) {
+        if name == "video-aspect-override", value == "no" { values[name] = .number(-2) }
+        else { values[name] = .string(value) }
+        engine?.set(name, value)
+    }
     func selectTrack(_ property: String, id: Int) { values[property] = .number(Double(id)); engine?.set(property, id == 0 ? "no" : String(id)) }
     func togglePause() { if loaded { set("pause", !paused); updateSystemPlayback() } else if let item = currentItem { load(item) } }
 
@@ -323,27 +430,67 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         case .toggleLibrary: showLibrary.toggle()
         case .toggleQueue: showQueue.toggle(); if showQueue { showInspector = false }
         case .toggleInspector: showInspector.toggle(); if showInspector { showQueue = false }
-        case .commands: showCommands = true; case .jumpToTime: showJump = true
+        case .commands: showCommands = true
         case .fullscreen: if !fullscreen.transitioning { window?.toggleFullScreen(nil) }
         case .alwaysOnTop: floating.toggle(); window?.level = floating ? .floating : .normal
         case .compactPlayer: toggleCompact()
         case .togglePause: togglePause(); case .stop: stop(); case .previous: previous(); case .next: next()
-        case .volumeUp: set("volume", min(100, volume + 5)); case .volumeDown: set("volume", max(0, volume - 5)); case .mute: set("mute", !muted)
+        case .volumeUp:
+            let nextVol = min(100, (volume + 5).rounded())
+            set("volume", nextVol); showHUD("Volume \(Int(nextVol))%")
+        case .volumeDown:
+            let nextVol = max(0, (volume - 5).rounded())
+            set("volume", nextVol); showHUD("Volume \(Int(nextVol))%")
+        case .mute:
+            let nextMuted = !muted
+            set("mute", nextMuted); showHUD(nextMuted ? "Muted" : "Volume \(Int(volume))%")
         default:
             guard loaded else { return }
             switch command {
-            case .backward: engine?.command(["seek", String(-preferences.seekSeconds), "relative+exact"])
-            case .forward: engine?.command(["seek", String(preferences.seekSeconds), "relative+exact"])
-            case .longBackward: engine?.command(["seek", "-60", "relative+exact"]); case .longForward: engine?.command(["seek", "60", "relative+exact"])
-            case .frameForward: engine?.command(["frame-step"]); case .frameBackward: engine?.command(["frame-back-step"])
-            case .speedUp: set("speed", min(4, speed + 0.1)); case .speedDown: set("speed", max(0.25, speed - 0.1)); case .normalSpeed: set("speed", 1)
-            case .subtitleEarlier: set("sub-delay", subtitleDelay - 0.1); case .subtitleLater: set("sub-delay", subtitleDelay + 0.1)
-            case .audioEarlier: set("audio-delay", audioDelay - 0.1); case .audioLater: set("audio-delay", audioDelay + 0.1)
-            case .loopA: set("ab-loop-a", position); notice = "Loop starts at \(TimeText.string(position))"
+            case .jumpToTime:
+                guard seekable else { errorMessage = "This media does not support seeking."; return }
+                showJump = true
+            case .backward:
+                startupResumeTarget = nil; startupSeekPending = false
+                engine?.command(["seek", String(-preferences.seekSeconds), "relative+exact"])
+                showHUD("−\(Int(preferences.seekSeconds))s")
+            case .forward:
+                startupResumeTarget = nil; startupSeekPending = false
+                engine?.command(["seek", String(preferences.seekSeconds), "relative+exact"])
+                showHUD("+\(Int(preferences.seekSeconds))s")
+            case .longBackward:
+                startupResumeTarget = nil; startupSeekPending = false
+                engine?.command(["seek", "-60", "relative+exact"]); showHUD("−1:00")
+            case .longForward:
+                startupResumeTarget = nil; startupSeekPending = false
+                engine?.command(["seek", "60", "relative+exact"]); showHUD("+1:00")
+            case .frameForward: engine?.command(["frame-step"])
+            case .frameBackward: engine?.command(["frame-back-step"])
+            case .speedUp:
+                let nextSpeed = PlaybackEngine.normalized("speed", min(4, speed + 0.1))
+                set("speed", nextSpeed); showHUD(String(format: "Speed %g×", nextSpeed))
+            case .speedDown:
+                let nextSpeed = PlaybackEngine.normalized("speed", max(0.25, speed - 0.1))
+                set("speed", nextSpeed); showHUD(String(format: "Speed %g×", nextSpeed))
+            case .normalSpeed:
+                set("speed", 1); showHUD("Speed 1×")
+            case .subtitleEarlier:
+                let nextDelay = PlaybackEngine.normalized("sub-delay", subtitleDelay - 0.1)
+                set("sub-delay", nextDelay); showHUD(String(format: "Subtitle delay %+.1fs", nextDelay))
+            case .subtitleLater:
+                let nextDelay = PlaybackEngine.normalized("sub-delay", subtitleDelay + 0.1)
+                set("sub-delay", nextDelay); showHUD(String(format: "Subtitle delay %+.1fs", nextDelay))
+            case .audioEarlier:
+                let nextDelay = PlaybackEngine.normalized("audio-delay", audioDelay - 0.1)
+                set("audio-delay", nextDelay); showHUD(String(format: "Audio delay %+.1fs", nextDelay))
+            case .audioLater:
+                let nextDelay = PlaybackEngine.normalized("audio-delay", audioDelay + 0.1)
+                set("audio-delay", nextDelay); showHUD(String(format: "Audio delay %+.1fs", nextDelay))
+            case .loopA: set("ab-loop-a", position); showNotice("Loop starts at \(TimeText.string(position))")
             case .loopB:
-                if case .number(let a) = values["ab-loop-a"], position > a { set("ab-loop-b", position) }
+                if case .number(let a) = values["ab-loop-a"], position > a { set("ab-loop-b", position); showNotice("Loop ends at \(TimeText.string(position))") }
                 else { errorMessage = "Set a loop start before the current position." }
-            case .clearLoop: engine?.set("ab-loop-a", "no"); engine?.set("ab-loop-b", "no")
+            case .clearLoop: set("ab-loop-a", "no"); set("ab-loop-b", "no"); showNotice("A–B loop cleared")
             case .screenshot: screenshot()
             case .resetAdjustments: resetAdjustments()
             default: break
@@ -355,7 +502,7 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         let panel = NSSavePanel(); panel.nameFieldStringValue = "Watch queue.lpqueue"
         panel.allowedContentTypes = [UTType(exportedAs: "com.aliahad.liplayer.queue", conformingTo: .json)]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try Playlist.encode(queue.items.map(\.url)).write(to: url, options: .atomic); notice = "Queue saved" }
+        do { try Playlist.encode(queue.items.map(\.url)).write(to: url, options: .atomic); showNotice("Queue saved") }
         catch { errorMessage = error.localizedDescription }
     }
     private func toggleCompact() {
@@ -364,25 +511,27 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
             compact = false; window.minSize = NSSize(width: 720, height: 480)
             if let frame = normalFrame { window.setFrame(frame, display: true) }
             floating = normalFloating; window.level = floating ? .floating : .normal
+            sidebar = normalSidebar; normalSidebar = nil
         } else {
-            normalFrame = window.frame; normalFloating = floating
-            compact = true; floating = true; showQueue = false; showInspector = false
+            normalFrame = window.frame; normalFloating = floating; normalSidebar = sidebar
+            compact = true; floating = true; sidebar = nil
             window.minSize = NSSize(width: 320, height: 220)
             window.setContentSize(NSSize(width: 480, height: 300)); window.level = .floating
         }
     }
-    func resetAdjustments() {
+    func resetAdjustments(showBanner: Bool = true) {
         for property in ["brightness", "contrast", "saturation", "gamma", "video-zoom", "video-pan-x", "video-pan-y", "video-rotate", "sub-delay", "audio-delay"] { set(property, 0) }
-        set("speed", 1); set("sub-scale", 1); set("sub-pos", 100); set("video-aspect-override", -1)
-        engine?.set("deinterlace", false); engine?.set("ab-loop-a", "no"); engine?.set("ab-loop-b", "no")
-        notice = "Current file adjustments reset"
+        set("speed", 1); set("sub-scale", 1); set("sub-pos", 100); set("video-aspect-override", "no")
+        set("deinterlace", false); set("ab-loop-a", "no"); set("ab-loop-b", "no")
+        if showBanner { showNotice("Current file adjustments reset") }
     }
     func screenshot() {
         let panel = NSSavePanel(); panel.allowedContentTypes = [.png]
-        panel.nameFieldStringValue = "\(currentItem?.url.deletingPathExtension().lastPathComponent ?? "Frame")-\(Int(position)).png"
+        let stem = currentItem?.url.deletingPathExtension().lastPathComponent ?? "Frame"
+        panel.nameFieldStringValue = String(format: "%@-%.1f.png", stem, position)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         engine?.command(["screenshot-to-file", url.path, "subtitles"])
-        notice = "Saving screenshot…"
+        showNotice("Saving screenshot…", autoDismiss: false)
     }
     private func receive(_ events: [EngineEvent]) {
         for event in events {
@@ -409,13 +558,24 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
                 finishLoading()
             case let .loadFailed(itemID, message):
                 if itemID == currentLoadID { loaded = false; phase = "Could not play"; errorMessage = message; updateSystemPlayback() }
-            case .restarted: playbackRevision += 1; if loaded { saveProgress() }
-            case let .screenshotWritten(path): notice = "Saved screenshot: \(URL(fileURLWithPath: path).lastPathComponent)"
+            case .restarted:
+                playbackRevision += 1
+                if loaded {
+                    if startupSeekPending, values["seeking"]?.flag != true {
+                        startupResumeTarget = nil; startupSeekPending = false; startupSeekFallbackTask?.cancel()
+                    }
+                    saveProgress()
+                }
+            case let .screenshotWritten(path): showNotice("Saved screenshot: \(URL(fileURLWithPath: path).lastPathComponent)")
             case let .ended(id, reason, error):
                 guard id == activeEntry, activeLoadID == currentLoadID else { continue }
                 if reason == 0 {
                     saveProgress(completed: true); loaded = false; phase = "Finished"
-                    if preferences.autoNext { next(automatic: true) }
+                    if queue.repeatMode == .item, let current = queue.current {
+                        load(current, preserveAdjustments: true)
+                    } else if preferences.autoNext || queue.repeatMode == .queue {
+                        next(automatic: true)
+                    }
                 } else if let error {
                     loaded = false; phase = "Could not play"; errorMessage = "Playback failed: \(error). Check that the file or drive is available and contains readable media."
                 }
@@ -427,34 +587,65 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     }
     private func updateProperty(_ name: String, _ value: EngineValue) {
         values[name] = value
-        if name == "time-pos", loaded, let target = startupResumeTarget, abs(value.number - target) < 0.12 {
-            startupResumeTarget = nil
+        if name == "time-pos", loaded, let target = startupResumeTarget, abs(value.number - target) < 0.25 {
+            startupResumeTarget = nil; startupSeekPending = false; startupSeekFallbackTask?.cancel()
             saveProgress()
         }
-        if name == "speed", value.number.isFinite, (0.25...4).contains(value.number) { workspaceSpeed = value.number }
+        if name == "speed", value.number.isFinite, (0.25...4).contains(value.number) { workspaceSpeed = PlaybackEngine.normalized("speed", value.number) }
         if name == "time-pos", loaded, Date().timeIntervalSince(lastHistoryWrite) > 5 { saveProgress() }
         if name == "time-pos", loaded, paused || Date().timeIntervalSince(lastSystemPlaybackUpdate) >= 1 { updateSystemPlayback() }
         if name == "pause" || name == "duration" || name == "speed" { updateSystemPlayback() }
         if name == "pause", value.flag, loaded { saveProgress() }
         if ["pause", "paused-for-cache", "track-list"].contains(name) { fullscreen.evaluate() }
-        if name == "volume" { preferences.volume = value.number }
+        if name == "volume", value.number.isFinite {
+            let clamped = min(100, max(0, value.number))
+            if abs(preferences.volume - clamped) > 0.01 {
+                preferences.volume = clamped
+                scheduleVolumeSave()
+            }
+        }
     }
     private func finishLoading() {
         deferredLoadedEntry = nil
-        loaded = true; phase = "Playing"
-        resetAdjustments(); notice = nil
+        loaded = true; phase = paused ? "Paused" : "Playing"
+        let keepAdjustments = preserveNextLoadAdjustments
+        preserveNextLoadAdjustments = false
+        if !keepAdjustments { resetAdjustments(showBanner: false); notice = nil }
+        var resumedNotice: String?
         if let record = pendingRestore {
             set("sub-delay", record.subtitleDelay); set("audio-delay", record.audioDelay)
             let resumePosition = pendingWorkspacePosition ?? record.resumePosition
             if preferences.resumePlayback, resumePosition > 0 {
                 engine?.command(["seek", String(resumePosition), "absolute+exact"])
-                notice = "Resumed at \(TimeText.string(resumePosition))"
+                resumedNotice = "Resumed at \(TimeText.string(resumePosition))"
+                if startupSeekPending {
+                    let loadID = currentLoadID
+                    startupSeekFallbackTask?.cancel()
+                    startupSeekFallbackTask = Task { @MainActor [weak self] in
+                        try? await Task.sleep(for: .seconds(2))
+                        guard !Task.isCancelled, let self, self.currentLoadID == loadID, self.startupSeekPending else { return }
+                        self.startupResumeTarget = nil; self.startupSeekPending = false
+                        self.saveProgress()
+                    }
+                }
+            } else {
+                startupResumeTarget = nil; startupSeekPending = false
             }
+        } else {
+            startupResumeTarget = nil; startupSeekPending = false
         }
         pendingRestore = nil
         pendingWorkspacePosition = nil
         if let restoredSpeed { set("speed", restoredSpeed); self.restoredSpeed = nil }
-        if let pendingLibraryNotice { notice = pendingLibraryNotice; self.pendingLibraryNotice = nil }
+        let libraryNotice = pendingLibraryNotice
+        pendingLibraryNotice = nil
+        if let resumedNotice, let libraryNotice {
+            showNotice("\(resumedNotice) · \(libraryNotice)", autoDismiss: false)
+        } else if let resumedNotice {
+            showNotice(resumedNotice, autoDismiss: true, duration: 8.0)
+        } else if let libraryNotice {
+            showNotice(libraryNotice, autoDismiss: false)
+        }
         if let itemID = currentItem?.id { pendingSubtitles.removeValue(forKey: itemID)?.forEach(attachSubtitle) }
         engine?.refresh(itemID: currentLoadID)
         updateSystemPlayback()
@@ -478,10 +669,23 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
             remoteTargets.append((command, target))
         }
         register(center.togglePlayPauseCommand) { [weak self] in self?.togglePause() }
-        register(center.playCommand) { [weak self] in self?.engine?.set("pause", false) }
-        register(center.pauseCommand) { [weak self] in self?.engine?.set("pause", true) }
+        register(center.playCommand) { [weak self] in
+            guard let self else { return }
+            if self.loaded { self.set("pause", false); self.updateSystemPlayback() }
+            else if let item = self.currentItem { self.load(item) }
+        }
+        register(center.pauseCommand) { [weak self] in
+            guard let self, self.loaded else { return }
+            self.set("pause", true); self.updateSystemPlayback()
+        }
         register(center.nextTrackCommand) { [weak self] in self?.next() }
         register(center.previousTrackCommand) { [weak self] in self?.previous() }
+        let seekTarget = center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            DispatchQueue.main.async { self?.seek(positionEvent.positionTime) }
+            return .success
+        }
+        remoteTargets.append((center.changePlaybackPositionCommand, seekTarget))
     }
     private func updateSystemPlayback() {
         lastSystemPlaybackUpdate = Date()
@@ -493,7 +697,8 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         } else if !playing, powerAssertion != 0 { IOPMAssertionRelease(powerAssertion); powerAssertion = 0 }
     }
     func shutdown(_ completion: @escaping @Sendable () -> Void) {
-        openTask?.cancel(); restoreTask?.cancel(); library.stop(); fullscreen.exit(); saveProgress()
+        openTask?.cancel(); restoreTask?.cancel(); noticeTask?.cancel(); hudTask?.cancel(); volumeSaveTask?.cancel(); startupSeekFallbackTask?.cancel()
+        library.stop(); fullscreen.exit(); saveProgress()
         let finalState = workspaceState()
         workspaceRevision += 1
         let revision = workspaceRevision
@@ -502,8 +707,9 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         remoteTargets.forEach { $0.0.removeTarget($0.1) }; remoteTargets = []
         if powerAssertion != 0 { IOPMAssertionRelease(powerAssertion); powerAssertion = 0 }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        (videoView as? VideoOpenGLView)?.clearRenderer()
         renderer?.stop(); renderer = nil
-        scopes.forEach { $0.stopAccessingSecurityScopedResource() }; scopes = []
+        scopes.forEach { $0.stopAccessingSecurityScopedResource() }; scopes.removeAll()
         let sanitizeBackup = !preferences.rememberWorkspace || !preferences.rememberHistory
         Task.detached(priority: .utility) { [workspaceWriter, engine] in
             do { try await workspaceWriter.save(finalState, revision: revision, sanitizeBackup: sanitizeBackup) }
@@ -513,9 +719,11 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
     }
 
     @concurrent private static func selectedFolders(in urls: [URL]) async throws -> [URL] {
-        try urls.filter { url in
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isPackageKey]
+        return try urls.filter { url in
             try Task.checkCancellation()
-            return url.isFileURL && (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            guard url.isFileURL, let values = try? url.resourceValues(forKeys: keys) else { return false }
+            return values.isDirectory == true && values.isPackage != true
         }
     }
     func addLibraryFolders(_ urls: [URL]) { library.add(urls); showLibrary = true }
@@ -533,7 +741,10 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         if let item = items.first(where: { $0.url == node.url }) { queue.select(item.id); load(item) }
     }
     private func retainAccess(to url: URL) {
-        if !scopes.contains(url), url.startAccessingSecurityScopedResource() { scopes.append(url) }
+        if !scopes.contains(url), url.startAccessingSecurityScopedResource() { scopes.insert(url) }
+    }
+    private func releaseAccess(to url: URL) {
+        if scopes.remove(url) != nil { url.stopAccessingSecurityScopedResource() }
     }
     func prepareForLaunch(restorePlayback: Bool) {
         library.refreshAll()
@@ -575,7 +786,7 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         guard preferences.rememberWorkspace else { return WorkspaceState() }
         var state = WorkspaceState()
         state.folders = library.folders; state.queue = queue.items; state.currentID = queue.currentID
-        state.repeatMode = queue.repeatMode; state.showLibrary = windowLibrary; state.sidebar = sidebar?.rawValue
+        state.repeatMode = queue.repeatMode; state.showLibrary = windowLibrary; state.sidebar = (compact ? normalSidebar : sidebar)?.rawValue
         state.speed = workspaceSpeed
         if preferences.rememberHistory, let item = currentItem, item.id == queue.currentID, item.url == queue.current?.url, item.url.isFileURL {
             if loaded && startupResumeTarget == nil { state.playback = ResumeRecord(url: item.url, bookmark: item.bookmark, position: position, duration: duration, subtitleDelay: subtitleDelay, audioDelay: audioDelay) }
@@ -601,9 +812,10 @@ struct Chapter: Identifiable { let id: Int; let title: String; let time: Double 
         }
     }
     private func relocateWorkspace(from previous: URL, to next: URL) {
+        let prefix = LibraryLocation.pathPrefix(of: previous)
         func moved(_ url: URL) -> URL {
-            guard url.isFileURL, url.path.hasPrefix(previous.path + "/") else { return url }
-            return next.appendingPathComponent(String(url.path.dropFirst(previous.path.count + 1)))
+            guard url.isFileURL, url.standardizedFileURL.path.hasPrefix(prefix) else { return url }
+            return next.appendingPathComponent(String(url.standardizedFileURL.path.dropFirst(prefix.count)))
         }
         func record(_ original: ResumeRecord) -> ResumeRecord {
             var result = original

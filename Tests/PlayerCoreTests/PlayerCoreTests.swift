@@ -61,7 +61,7 @@ import Testing
 @Test(arguments: [("90", 90.0), ("01:02", 62), ("1:02:03.5", 3723.5), (" 0:05 ", 5)])
 func timeParsing(_ value: String, expected: Double) { #expect(TimeText.parse(value) == expected) }
 
-@Test(arguments: ["", "-1", "nan", "inf", "1:60", "1::2", ":5", "1:2:3:4", "1:99:00"])
+@Test(arguments: ["", "-1", "nan", "inf", "1:60", "1::2", ":5", "1:2:3:4", "1:99:00", "1.5:00", "1:2.5:03", "0x10", "1e2", "+5"])
 func rejectsInvalidTimes(_ value: String) { #expect(TimeText.parse(value) == nil) }
 
 @Test func formattingHandlesNonFiniteAndLongMedia() {
@@ -173,4 +173,79 @@ func rejectsInvalidTimes(_ value: String) { #expect(TimeText.parse(value) == nil
     try migratedStore.write(updated, name: "preferences.json")
     DiskStore.migrateIfNeeded(from: legacy, to: target)
     #expect(migratedStore.read(Preferences.self, name: "preferences.json")?.volume == 85)
+}
+
+@Test func shortcutHandlesPlusKeyRejectsLiteralSpaceAndNormalizes() {
+    #expect(Shortcut("+")?.canonical == "+")
+    #expect(Shortcut("cmd++")?.canonical == "cmd++")
+    #expect(Shortcut(" shift+cmd++ ")?.canonical == "cmd+shift++")
+    #expect(Shortcut(" ") == nil)
+    #expect(Shortcut("cmd+ ") == nil)
+    let normalized = Shortcut.normalized([
+        PlayerCommand.open.rawValue: " SHIFT+CMD+O ",
+        PlayerCommand.mute.rawValue: "",
+        "unknownCommand": "k",
+        PlayerCommand.stop.rawValue: "invalid shortcut"
+    ])
+    #expect(normalized[PlayerCommand.open.rawValue] == "cmd+shift+o")
+    #expect(normalized[PlayerCommand.mute.rawValue] == "")
+    #expect(normalized["unknownCommand"] == nil)
+    #expect(normalized[PlayerCommand.stop.rawValue] == nil)
+}
+
+@Test func networkMediaTitleDistinguishesPathsAndFallsBackToHost() {
+    let ep1 = MediaItem(url: URL(string: "https://cdn.example.com/shows/episode1.mp4")!)
+    let ep2 = MediaItem(url: URL(string: "https://cdn.example.com/shows/episode2.mp4")!)
+    let bare = MediaItem(url: URL(string: "https://cdn.example.com/")!)
+    #expect(ep1.title == "episode1.mp4")
+    #expect(ep2.title == "episode2.mp4")
+    #expect(ep1.title != ep2.title)
+    #expect(bare.title == "cdn.example.com")
+}
+
+@Test func m3uHandlesColonFilenamesBOMAndEncodedURLs() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let playlist = directory.appendingPathComponent("episodes.m3u")
+    let content = "\u{FEFF}#EXTM3U\n10:00-clip.mp4\nPart 1: Intro.mp4\nvideo-#EXT-X-note.mp4\nhttps://example.com/my video.mp4\n"
+    try Data(content.utf8).write(to: playlist)
+    let entries = try #require(try Playlist.read(playlist))
+    #expect(entries.count == 4)
+    #expect(entries[0].isFileURL && entries[0].lastPathComponent == "10:00-clip.mp4")
+    #expect(entries[1].isFileURL && entries[1].lastPathComponent == "Part 1: Intro.mp4")
+    #expect(entries[2].isFileURL && entries[2].lastPathComponent == "video-#EXT-X-note.mp4")
+    #expect(entries[3].scheme == "https" && entries[3].host == "example.com")
+
+    let invalid = directory.appendingPathComponent("bad.m3u")
+    try Data("#EXTM3U\nftp://example.com/clip.mp4\n".utf8).write(to: invalid)
+    #expect(throws: Playlist.Failure.self) { _ = try Playlist.read(invalid) }
+}
+
+@Test func expandSkipsPackagesAndUnsupportedFiles() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory.appendingPathComponent("Fake.app"), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let video = directory.appendingPathComponent("clip.mp4")
+    let doc = directory.appendingPathComponent("notes.txt")
+    let pkgVideo = directory.appendingPathComponent("Fake.app/inside.mp4")
+    try Data().write(to: video)
+    try Data().write(to: doc)
+    try Data().write(to: pkgVideo)
+    let expanded = try await MediaFiles.expand([directory.appendingPathComponent("Fake.app"), doc, video])
+    #expect(expanded == [video])
+}
+
+@Test func preferencesSanitizesCorruptedValuesOnDecode() throws {
+    let json = """
+    {"seekSeconds":-10,"volume":999,"subtitleSize":-5,"subtitleFont":"   ","appearance":"invalid","shortcuts":{"open":"SHIFT+ALT+O","mute":"invalid key"}}
+    """
+    let prefs = try JSONDecoder().decode(Preferences.self, from: Data(json.utf8))
+    #expect(prefs.seekSeconds == 5.0)
+    #expect(prefs.volume == 100.0)
+    #expect(prefs.subtitleSize == 12.0)
+    #expect(prefs.subtitleFont == "sans-serif")
+    #expect(prefs.appearance == "system")
+    #expect(prefs.shortcuts[PlayerCommand.open.rawValue] == "alt+shift+o")
+    #expect(prefs.shortcuts[PlayerCommand.mute.rawValue] == nil)
 }

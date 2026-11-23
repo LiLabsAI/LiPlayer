@@ -24,6 +24,7 @@ VENDOR = ROOT / 'Vendor'
 LIB = VENDOR / 'lib'
 LIB.mkdir(parents=True, exist_ok=True)
 ENV = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE='1')
+BREW_PREFIX = os.environ.get('HOMEBREW_PREFIX', '/opt/homebrew').rstrip('/')
 records = {}
 bundled = {}
 parser = argparse.ArgumentParser()
@@ -52,10 +53,16 @@ def bottle(formula):
             request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + token})
             cache.parent.mkdir(parents=True, exist_ok=True)
             temporary = cache.with_suffix('.download')
-            with urllib.request.urlopen(request, timeout=30) as response, temporary.open('wb') as output:
-                while chunk := response.read(2 * 1024 * 1024): output.write(chunk)
-            temporary.rename(cache)
-        if hashlib.file_digest(cache.open('rb'), 'sha256').hexdigest() != record['sha256']:
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response, temporary.open('wb') as output:
+                    while chunk := response.read(2 * 1024 * 1024): output.write(chunk)
+                temporary.rename(cache)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
+        with cache.open('rb') as handle:
+            actual_sha = hashlib.file_digest(handle, 'sha256').hexdigest()
+        if actual_sha != record['sha256']:
             raise RuntimeError('Native dependency checksum mismatch: ' + formula)
         records[formula] = record
         archives[formula] = cache
@@ -66,7 +73,9 @@ def bottle(formula):
             subprocess.run(['brew', 'fetch', '--force-bottle', formula], env=ENV, check=True)
         data = json.loads(run('brew', 'info', '--json=v2', formula))['formulae'][0]
         tag = next(tag for tag in data['bottle']['stable']['files'] if tag in cache.name)
-        records[formula] = {'formula': formula, 'version': data['versions']['stable'], 'license': data['license'], 'source': data['urls']['stable'], 'bottle': cache.name, 'bottle_url': data['bottle']['stable']['files'][tag]['url'], 'sha256': hashlib.file_digest(cache.open('rb'), 'sha256').hexdigest()}
+        with cache.open('rb') as handle:
+            sha256 = hashlib.file_digest(handle, 'sha256').hexdigest()
+        records[formula] = {'formula': formula, 'version': data['versions']['stable'], 'license': data['license'], 'source': data['urls']['stable'], 'bottle': cache.name, 'bottle_url': data['bottle']['stable']['files'][tag]['url'], 'sha256': sha256}
     # Ask Homebrew for the exact current bottle, not an arbitrary cached revision.
     archives[formula] = pathlib.Path(run('brew', '--cache', '--force-bottle', formula))
     return archives[formula]
@@ -91,11 +100,12 @@ def extract(formula, suffix, destination):
 
 def collect(original, owner=None):
     if original.startswith('@rpath/') and owner:
-        original = '/opt/homebrew/opt/' + owner + '/lib/' + original.removeprefix('@rpath/')
+        original = BREW_PREFIX + '/opt/' + owner + '/lib/' + original.removeprefix('@rpath/')
     # Both fixed-prefix and relocatable Homebrew bottles are accepted.
-    match = re.search(r'(?:/opt/homebrew|@@HOMEBREW_PREFIX@@)/opt/([^/]+)/(.+)', original)
+    escaped_prefix = re.escape(BREW_PREFIX)
+    match = re.search(rf'(?:{escaped_prefix}|/opt/homebrew|/usr/local|@@HOMEBREW_PREFIX@@)/opt/([^/]+)/(.+)', original)
     if not match:
-        match = re.search(r'(?:/opt/homebrew/Cellar|@@HOMEBREW_CELLAR@@)/([^/]+)/[^/]+/(.+)', original)
+        match = re.search(rf'(?:{escaped_prefix}/Cellar|/opt/homebrew/Cellar|/usr/local/Cellar|@@HOMEBREW_CELLAR@@)/([^/]+)/[^/]+/(.+)', original)
     if not match:
         if original.startswith(('/System/', '/usr/lib/')): return
         raise RuntimeError(f'Unresolved native dependency: {original}')
@@ -110,7 +120,7 @@ def collect(original, owner=None):
         if dependency.startswith(('/System/', '/usr/lib/')): continue
         collect(dependency, formula)
 
-collect('/opt/homebrew/opt/mpv/lib/libmpv.2.dylib')
+collect(BREW_PREFIX + '/opt/mpv/lib/libmpv.2.dylib')
 with tarfile.open(bottle('mpv')) as tar:
     for member in tar.getmembers():
         if member.isfile() and '/include/mpv/' in member.name:

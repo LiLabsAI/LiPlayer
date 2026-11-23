@@ -46,6 +46,19 @@ public struct Preferences: Codable, Equatable, Sendable {
         appearance = try values.decodeIfPresent(String.self, forKey: .appearance) ?? appearance
         shortcuts = try values.decodeIfPresent([String: String].self, forKey: .shortcuts) ?? shortcuts
         rememberWorkspace = try values.decodeIfPresent(Bool.self, forKey: .rememberWorkspace) ?? rememberWorkspace
+        sanitize()
+    }
+    public mutating func sanitize() {
+        if !seekSeconds.isFinite || seekSeconds <= 0 { seekSeconds = 5.0 }
+        else { seekSeconds = min(300.0, max(1.0, seekSeconds)) }
+        if !volume.isFinite { volume = 70.0 }
+        else { volume = min(100.0, max(0.0, volume)) }
+        if !subtitleSize.isFinite { subtitleSize = 40.0 }
+        else { subtitleSize = min(120.0, max(12.0, subtitleSize)) }
+        let trimmedFont = subtitleFont.trimmingCharacters(in: .whitespacesAndNewlines)
+        subtitleFont = trimmedFont.isEmpty ? "sans-serif" : trimmedFont
+        if !["system", "light", "dark"].contains(appearance) { appearance = "system" }
+        shortcuts = Shortcut.normalized(shortcuts)
     }
 }
 

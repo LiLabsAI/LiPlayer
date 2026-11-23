@@ -87,6 +87,7 @@ import PlayerCore
         policy.setFullscreen(false, at: now); applyVisibility(); onExit?()
     }
     func reveal() { policy.activity(at: now); applyVisibility() }
+    func clearKeyboardNavigation() { keyboardNavigation = false }
     func setScrubbing(_ value: Bool) { guard active else { return }; scrubbing = value; reveal() }
     func pointerIsOverControls(_ mouse: NSPoint) -> Bool {
         guard let window else { return false }

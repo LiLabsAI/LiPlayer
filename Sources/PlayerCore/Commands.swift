@@ -55,11 +55,22 @@ public struct Shortcut: Equatable, Sendable {
     public let key: String
     public let modifiers: Set<String>
     public init?(_ text: String) {
-        let parts = text.lowercased().split(separator: "+", omittingEmptySubsequences: false).map(String.init)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return nil }
+        let parts: [String]
+        if trimmed == "+" {
+            parts = ["+"]
+        } else if trimmed.hasSuffix("++") {
+            let prefix = String(trimmed.dropLast(2))
+            parts = prefix.split(separator: "+", omittingEmptySubsequences: false).map(String.init) + ["+"]
+        } else {
+            parts = trimmed.split(separator: "+", omittingEmptySubsequences: false).map(String.init)
+        }
         guard let key = parts.last, !key.isEmpty else { return nil }
         let modifiers = Set(parts.dropLast())
         guard modifiers.isSubset(of: ["cmd", "ctrl", "alt", "shift"]), modifiers.count == parts.count - 1 else { return nil }
-        guard key.count == 1 || ["space", "left", "right", "up", "down", "backspace", "return", "escape"].contains(key) else { return nil }
+        let isSingleNonWhitespace = key.count == 1 && !key.unicodeScalars.allSatisfy(CharacterSet.whitespacesAndNewlines.contains)
+        guard isSingleNonWhitespace || ["space", "left", "right", "up", "down", "backspace", "return", "escape"].contains(key) else { return nil }
         self.key = key
         self.modifiers = modifiers
     }
@@ -69,10 +80,20 @@ public struct Shortcut: Equatable, Sendable {
         let keys = ["space": "Space", "left": "←", "right": "→", "up": "↑", "down": "↓", "backspace": "⌫", "return": "↩", "escape": "Esc"]
         return ["ctrl", "alt", "shift", "cmd"].filter { modifiers.contains($0) }.compactMap { symbols[$0] }.joined() + (keys[key] ?? key.uppercased())
     }
+    public static func normalized(_ bindings: [String: String]) -> [String: String] {
+        var result: [String: String] = [:]
+        for command in PlayerCommand.allCases {
+            guard let raw = bindings[command.rawValue] else { continue }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { result[command.rawValue] = "" }
+            else if let parsed = Shortcut(trimmed) { result[command.rawValue] = parsed.canonical }
+        }
+        return result
+    }
     public static func validate(_ bindings: [String: String]) -> String? {
         var seen: [String: String] = [:]
         for command in PlayerCommand.allCases {
-            let value = bindings[command.rawValue] ?? command.defaultShortcut
+            let value = (bindings[command.rawValue] ?? command.defaultShortcut).trimmingCharacters(in: .whitespacesAndNewlines)
             if value.isEmpty { continue }
             guard let shortcut = Shortcut(value) else { return "Invalid shortcut for \(command.title). Use a key such as cmd+shift+s or space." }
             if ["cmd+q", "cmd+w", "cmd+,", "cmd+h", "cmd+alt+h", "cmd+m", "cmd+a", "cmd+c", "cmd+v", "cmd+x", "cmd+z", "cmd+shift+z"].contains(shortcut.canonical) { return "\(shortcut.display) is reserved for a standard Mac command." }

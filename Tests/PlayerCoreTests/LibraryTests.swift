@@ -132,3 +132,14 @@ private func temporaryFolder() throws -> URL {
     queue.update(moved)
     #expect(queue.current == moved && queue.currentIndex == 1)
 }
+
+@Test func libraryLocationPrefixHandlesRootAndSiblingFolders() {
+    let root = URL(fileURLWithPath: "/")
+    let movies = URL(fileURLWithPath: "/Users/test/Movies")
+    let moviesBackup = URL(fileURLWithPath: "/Users/test/Movies2/clip.mp4")
+    let insideMovies = URL(fileURLWithPath: "/Users/test/Movies/clip.mp4")
+    #expect(LibraryLocation.pathPrefix(of: root) == "/")
+    #expect(LibraryLocation.contains(insideMovies, inside: root))
+    #expect(LibraryLocation.contains(insideMovies, inside: movies))
+    #expect(!LibraryLocation.contains(moviesBackup, inside: movies))
+}

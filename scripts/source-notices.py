@@ -26,6 +26,8 @@ output.mkdir(parents=True, exist_ok=True)
 count = 0
 for record in records:
     archive = ROOT / '.build/SourceDownloads' / record['file']
+    if not archive.is_file():
+        raise SystemExit(f'Missing source download: {archive}. Run `python3 scripts/collect-sources.py` first.')
     if record['kind'] == 'license':
         shutil.copy2(archive, ROOT / 'ThirdParty' / record['file'])
         continue

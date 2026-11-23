@@ -26,7 +26,10 @@ parser.add_argument('--app', type=pathlib.Path, default=ROOT / 'dist/LiPlayer QA
 parser.add_argument('--stay-open', action='store_true')
 parser.add_argument('--https-url', help='Optional trusted public HTTPS media URL for an online check')
 args = parser.parse_args()
+if not (FIXTURES / 'Sample.mp4').is_file():
+    raise SystemExit('Fixtures missing. Run `python3 scripts/make-fixtures.py` first.')
 requests = []
+requests_lock = threading.Lock()
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -43,7 +46,8 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
             start = int(match[1]); end = min(int(match[2]), end) if match[2] else end
             if start > end:
                 file.close(); self.send_error(416); return None
-        requests.append({'range': requested is not None, 'status': 206 if requested else 200})
+        with requests_lock:
+            requests.append({'range': requested is not None, 'status': 206 if requested else 200})
         self.send_response(206 if requested else 200)
         self.send_header('Content-Type', self.guess_type(str(path)))
         self.send_header('Accept-Ranges', 'bytes')
@@ -83,9 +87,13 @@ threading.Thread(target=tls_server.serve_forever, daemon=True).start()
 command += ['--untrusted-https-test-url', f'https://localhost:{tls_server.server_port}/Sample.mp4']
 if args.https_url: command += ['--https-test-url', args.https_url]
 isolation = pathlib.Path('/usr/bin/sandbox-exec')
-if isolation.exists(): command = [str(isolation), '-p', '(version 1)(allow default)(deny file-read* (subpath "/opt/homebrew"))', *command]
+if isolation.exists():
+    brew_prefixes = sorted({p for p in ['/opt/homebrew', os.environ.get('HOMEBREW_PREFIX')] if p and p.startswith('/')})
+    deny_rules = ''.join(f'(deny file-read* (subpath "{prefix}"))' for prefix in brew_prefixes)
+    command = [str(isolation), '-p', f'(version 1)(allow default){deny_rules}', *command]
 if args.stay_open: command.append('--stay-open')
 log = ROOT / '.build/runtime-verification.log'
+log.parent.mkdir(parents=True, exist_ok=True)
 try:
     with log.open('w') as output:
         result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=None if args.stay_open else 150)

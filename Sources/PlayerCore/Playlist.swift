@@ -36,18 +36,35 @@ public enum Playlist {
     }
     public static func read(_ url: URL) throws -> [URL]? {
         guard url.isFileURL else { return nil }
-        if ["lpqueue", "vpqueue"].contains(url.pathExtension.lowercased()) { return try decode(Data(contentsOf: url)) }
-        guard ["m3u", "m3u8"].contains(url.pathExtension.lowercased()) else { return nil }
+        let ext = url.pathExtension.lowercased()
+        let isQueue = ["lpqueue", "vpqueue"].contains(ext)
+        let isM3U = ["m3u", "m3u8"].contains(ext)
+        guard isQueue || isM3U else { return nil }
+        if let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 8_000_000 { throw Failure.invalid }
+        if isQueue { return try decode(Data(contentsOf: url)) }
         let data = try Data(contentsOf: url)
-        guard data.count <= 8_000_000, let text = String(data: data, encoding: .utf8) else { throw Failure.invalid }
+        guard data.count <= 8_000_000, var text = String(data: data, encoding: .utf8) else { throw Failure.invalid }
+        if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+        let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
         // HLS is one media source, not a queue of individual segments.
-        if text.contains("#EXT-X-") { return nil }
-        let entries = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !$0.hasPrefix("#") }.map { line in
-            if let address = URL(string: line), address.scheme != nil { return address }
-            return URL(fileURLWithPath: line, relativeTo: url.deletingLastPathComponent()).standardizedFileURL
+        if lines.contains(where: { $0.hasPrefix("#EXT-X-") }) { return nil }
+        let baseDirectory = url.deletingLastPathComponent()
+        let entries: [URL] = try lines.filter { !$0.isEmpty && !$0.hasPrefix("#") }.map { line in
+            if hasExplicitScheme(line) {
+                if let address = URL(string: line) { return address }
+                if let encoded = line.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed), let address = URL(string: encoded) { return address }
+                throw Failure.invalid
+            }
+            return URL(fileURLWithPath: line, relativeTo: baseDirectory).standardizedFileURL
         }
         guard entries.count <= 10_000, entries.allSatisfy(valid) else { throw Failure.invalid }
         return entries
+    }
+    private static func hasExplicitScheme(_ line: String) -> Bool {
+        guard let range = line.range(of: "://") else { return false }
+        let scheme = line[..<range.lowerBound]
+        guard let first = scheme.first, first.isASCII && first.isLetter else { return false }
+        return scheme.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "+.-".contains($0)) }
     }
     private static func valid(_ url: URL) -> Bool { ["file", "http", "https", "rtsp", "rtmp"].contains(url.scheme?.lowercased() ?? "") && !url.absoluteString.contains("\0") }
 }

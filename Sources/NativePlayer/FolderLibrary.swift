@@ -55,6 +55,7 @@ private actor FolderScanner {
     var changed: (() -> Void)?
     var reportError: ((String) -> Void)?
     var relocated: ((URL, URL) -> Void)?
+    var removedRoot: ((URL) -> Void)?
     private var refreshedAt = Date.distantPast
     private let scanner = FolderScanner()
     private var tasks: [LibraryLocation: Task<Void, Never>] = [:]
@@ -63,6 +64,8 @@ private actor FolderScanner {
 
     func add(_ urls: [URL]) {
         for original in urls {
+            let values = try? original.resourceValues(forKeys: [.isPackageKey, .isRegularFileKey])
+            if values?.isPackage == true || values?.isRegularFile == true { continue }
             let url = original.standardizedFileURL.resolvingSymlinksInPath()
             if let existing = folders.first(where: { $0.url == url }) { setExpanded(existing.node, true); refresh(existing.id); continue }
             guard folders.count < 1_000 else { reportError?("The library can remember up to 1,000 root folders."); break }
@@ -120,7 +123,9 @@ private actor FolderScanner {
     func refreshAll() { refreshedAt = Date(); for root in folders { refresh(root.id) } }
     func refreshIfNeeded() { if Date().timeIntervalSince(refreshedAt) > 30 { refreshAll() } }
     func remove(_ rootID: UUID) {
+        let removedURL = folders.first(where: { $0.id == rootID })?.url
         folders.removeAll { $0.id == rootID }; refresh(rootID); changed?()
+        if let removedURL { removedRoot?(removedURL) }
     }
     func locate(_ rootID: UUID) {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
@@ -130,13 +135,17 @@ private actor FolderScanner {
     }
     func relink(_ rootID: UUID, to url: URL) {
         guard let index = folders.firstIndex(where: { $0.id == rootID }) else { return }
-        guard !folders.contains(where: { $0.id != rootID && $0.url == url.standardizedFileURL }) else { reportError?("That folder is already in the library."); return }
+        let normalized = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard !folders.contains(where: { $0.id != rootID && $0.url == normalized }) else { reportError?("That folder is already in the library."); return }
         let scoped = url.startAccessingSecurityScopedResource()
         let previous = folders[index].url
-        folders[index].url = url.standardizedFileURL
+        folders[index].url = normalized
         folders[index].bookmark = try? url.bookmarkData(options: .withSecurityScope)
         if scoped { url.stopAccessingSecurityScopedResource() }
-        if previous != folders[index].url { relocated?(previous, folders[index].url) }
+        if previous != folders[index].url {
+            removedRoot?(previous)
+            relocated?(previous, folders[index].url)
+        }
         changed?(); refresh(rootID)
     }
     func mediaSiblings(of node: LibraryNode) -> [LibraryNode] {
@@ -144,7 +153,7 @@ private actor FolderScanner {
         return children[LibraryLocation(rootID: node.location.rootID, path: parent)]?.filter { !$0.isFolder } ?? [node]
     }
     func waitForRoot(containing url: URL) async {
-        guard let root = folders.first(where: { url.path.hasPrefix($0.url.path + "/") }), let task = tasks[root.node.id] else { return }
+        guard let root = folders.first(where: { LibraryLocation.contains(url, inside: $0.url) }), let task = tasks[root.node.id] else { return }
         await task.value
     }
     func stop() { tasks.values.forEach { $0.cancel() }; tasks = [:] }

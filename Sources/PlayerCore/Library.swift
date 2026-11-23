@@ -25,6 +25,14 @@ public struct LibraryLocation: Codable, Hashable, Sendable {
     public static func valid(_ path: String) -> Bool {
         !path.hasPrefix("/") && !path.contains("\0") && !path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." })
     }
+    public static func pathPrefix(of folderURL: URL) -> String {
+        let path = folderURL.standardizedFileURL.path
+        return path.hasSuffix("/") ? path : path + "/"
+    }
+    public static func contains(_ fileURL: URL, inside folderURL: URL) -> Bool {
+        guard fileURL.isFileURL, folderURL.isFileURL else { return false }
+        return fileURL.standardizedFileURL.path.hasPrefix(pathPrefix(of: folderURL))
+    }
 }
 
 public struct LibraryFolder: Identifiable, Codable, Equatable, Sendable {
@@ -124,30 +132,45 @@ public struct WorkspaceStore: Sendable {
         try state.validate()
         return state
     }
+    private func readBoundedData(at url: URL) -> Data? {
+        if let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 16_000_000 { return nil }
+        return try? Data(contentsOf: url)
+    }
     public func load() throws -> (state: WorkspaceState, recovered: Bool) {
         let primary = directory.appendingPathComponent("workspace.json")
         let backup = directory.appendingPathComponent("workspace.backup.json")
-        if let data = try? Data(contentsOf: primary) {
-            do { return (try decode(data), false) }
-            catch WorkspaceFailure.newerVersion { throw WorkspaceFailure.newerVersion }
-            catch { if let data = try? Data(contentsOf: backup), let state = try? decode(data) { return (state, true) }; throw WorkspaceFailure.invalid }
+        if FileManager.default.fileExists(atPath: primary.path) {
+            if let data = readBoundedData(at: primary) {
+                do { return (try decode(data), false) }
+                catch WorkspaceFailure.newerVersion { throw WorkspaceFailure.newerVersion }
+                catch { if let backupData = readBoundedData(at: backup), let state = try? decode(backupData) { return (state, true) }; throw WorkspaceFailure.invalid }
+            }
+            if let backupData = readBoundedData(at: backup), let state = try? decode(backupData) { return (state, true) }
+            throw WorkspaceFailure.invalid
         }
-        if let data = try? Data(contentsOf: backup) { return (try decode(data), true) }
-        if FileManager.default.fileExists(atPath: primary.path) || FileManager.default.fileExists(atPath: backup.path) { throw WorkspaceFailure.invalid }
+        if FileManager.default.fileExists(atPath: backup.path) {
+            guard let data = readBoundedData(at: backup) else { throw WorkspaceFailure.invalid }
+            return (try decode(data), true)
+        }
         return (WorkspaceState(), false)
     }
     public func write(_ state: WorkspaceState) throws {
         try state.validate()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let primary = directory.appendingPathComponent("workspace.json")
-        if let data = try? Data(contentsOf: primary) {
-            do {
-                _ = try decode(data)
-                try data.write(to: directory.appendingPathComponent("workspace.backup.json"), options: .atomic)
-            } catch WorkspaceFailure.newerVersion { throw WorkspaceFailure.newerVersion }
-            catch {
-                // Preserve unreadable state instead of silently destroying the only copy.
-                try data.write(to: directory.appendingPathComponent("workspace-unreadable-\(UUID().uuidString).json"), options: .atomic)
+        if FileManager.default.fileExists(atPath: primary.path) {
+            if let data = readBoundedData(at: primary) {
+                do {
+                    _ = try decode(data)
+                    try data.write(to: directory.appendingPathComponent("workspace.backup.json"), options: .atomic)
+                } catch WorkspaceFailure.newerVersion { throw WorkspaceFailure.newerVersion }
+                catch {
+                    // Preserve unreadable state instead of silently destroying the only copy.
+                    try data.write(to: directory.appendingPathComponent("workspace-unreadable-\(UUID().uuidString).json"), options: .atomic)
+                }
+            } else {
+                // Move oversized unreadable file aside without loading it into memory.
+                try? FileManager.default.moveItem(at: primary, to: directory.appendingPathComponent("workspace-unreadable-\(UUID().uuidString).json"))
             }
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]

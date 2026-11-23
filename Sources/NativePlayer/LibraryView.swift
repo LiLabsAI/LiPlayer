@@ -22,6 +22,7 @@ import PlayerCore
 struct LibraryView: View {
     var session: PlayerSession
     @State private var selection: LibraryLocation?
+    @State private var filterText = ""
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -34,6 +35,9 @@ struct LibraryView: View {
                     Button("Hide Library") { session.showLibrary = false }
                 } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Library actions")
             }.padding(16)
+            if !session.library.folders.isEmpty {
+                TextField("Filter loaded items", text: $filterText).textFieldStyle(.roundedBorder).font(.system(size: 12)).padding(.horizontal, 12).padding(.bottom, 10)
+            }
             Divider()
             if session.library.folders.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
@@ -44,12 +48,10 @@ struct LibraryView: View {
                 Spacer()
             } else {
                 List(selection: $selection) {
-                    ForEach(session.library.folders) { folder in LibraryRow(node: folder.node, session: session) }
+                    ForEach(session.library.folders) { folder in LibraryRow(node: folder.node, session: session, selection: $selection, filter: filterText.trimmingCharacters(in: .whitespacesAndNewlines)) }
                 }.listStyle(.sidebar).accessibilityLabel("Folder library")
                     .onKeyPress(.return) {
-                        guard let selection else { return .ignored }
-                        let nodes = session.library.folders.map(\.node) + session.library.children.values.flatMap { $0 }
-                        guard let node = nodes.first(where: { $0.id == selection }) else { return .ignored }
+                        guard let selection, let node = resolveNode(selection) else { return .ignored }
                         if node.isFolder { session.library.setExpanded(node, !session.library.isExpanded(node)) }
                         else { session.playLibraryNode(node) }
                         return .handled
@@ -66,12 +68,34 @@ struct LibraryView: View {
             }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading).padding(14)
         }.background(.background)
     }
+    private func resolveNode(_ location: LibraryLocation) -> LibraryNode? {
+        if location.path.isEmpty {
+            return session.library.folders.first(where: { $0.id == location.rootID })?.node
+        }
+        let parent = (location.path as NSString).deletingLastPathComponent
+        let parentLocation = LibraryLocation(rootID: location.rootID, path: parent)
+        return session.library.children[parentLocation]?.first(where: { $0.id == location })
+    }
 }
 
 private struct LibraryRow: View {
     let node: LibraryNode
     var session: PlayerSession
+    @Binding var selection: LibraryLocation?
+    let filter: String
     private var library: FolderLibrary { session.library }
+    private func filteredChildren(_ items: [LibraryNode]) -> [LibraryNode] {
+        guard !filter.isEmpty else { return items }
+        return items.filter { child in
+            if child.title.localizedCaseInsensitiveContains(filter) { return true }
+            if child.isFolder { return hasMatchingDescendant(child) }
+            return false
+        }
+    }
+    private func hasMatchingDescendant(_ folder: LibraryNode) -> Bool {
+        guard let items = library.children[folder.id] else { return false }
+        return items.contains { $0.title.localizedCaseInsensitiveContains(filter) || ($0.isFolder && hasMatchingDescendant($0)) }
+    }
     var body: some View {
         Group {
             if node.isFolder {
@@ -84,8 +108,10 @@ private struct LibraryRow: View {
                             HStack { Button("Refresh") { library.refresh(node.location.rootID) }; Button("Locate Root…") { library.locate(node.location.rootID) } }.controlSize(.small)
                         }.font(.system(size: 12)).padding(.vertical, 6)
                     } else if let children = library.children[node.id] {
+                        let visible = filteredChildren(children)
                         if children.isEmpty { Text("No media or subfolders.").font(.system(size: 12)).foregroundStyle(.secondary).padding(.vertical, 6) }
-                        ForEach(children) { child in LibraryRow(node: child, session: session) }
+                        else if visible.isEmpty { Text("No matches in this folder.").font(.system(size: 12)).foregroundStyle(.secondary).padding(.vertical, 6) }
+                        ForEach(visible) { child in LibraryRow(node: child, session: session, selection: $selection, filter: filter) }
                     }
                 } label: {
                     Label(node.title, systemImage: "folder").font(.system(size: 13)).lineLimit(1).help(node.url.path)
@@ -99,12 +125,15 @@ private struct LibraryRow: View {
                     }
                 }.onAppear { if library.isExpanded(node) { library.load(node) } }
             } else {
-                Button { session.playLibraryNode(node) } label: {
+                Button {
+                    selection = node.id
+                    session.playLibraryNode(node)
+                } label: {
                     Label(node.title, systemImage: session.currentItem?.url == node.url ? "play.fill" : MediaFiles.videoExtensions.contains(node.url.pathExtension.lowercased()) ? "film" : "waveform")
                         .font(.system(size: 13, weight: session.currentItem?.url == node.url ? .medium : .regular)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4).contentShape(Rectangle())
                 }.buttonStyle(.plain).help(node.url.path).accessibilityLabel("Play \(node.title)")
                     .contextMenu {
-                        Button("Play") { session.playLibraryNode(node) }
+                        Button("Play") { selection = node.id; session.playLibraryNode(node) }
                         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([node.url]) }
                     }
             }

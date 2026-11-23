@@ -242,17 +242,18 @@ final class PlaybackSelfTest {
     }
     private func write(success: Bool, error: String?) {
         (NSApp.delegate as? AppDelegate)?.testExitStatus = success ? 0 : 1
-        var report: [String: Any] = ["success": success, "checks": checks, "date": ISO8601DateFormatter().string(from: Date()), "engine": "libmpv 0.42.0", "presentation": "OpenGL SDR"]
+        var report: [String: Any] = ["success": success, "checks": checks, "date": ISO8601DateFormatter().string(from: Date()), "engine": session.engineVersion, "presentation": "OpenGL SDR"]
         report["final_video_parameters"] = ["width": session.values["video-params"]?["w"].number ?? 0, "height": session.values["video-params"]?["h"].number ?? 0, "transfer": session.values["video-params"]?["gamma"].string ?? ""]
         report["hardware_decoder"] = session.values["hwdec-current"]?.string ?? ""
         let frameworkRoot = Bundle.main.bundleURL.appendingPathComponent("Contents/Frameworks").path + "/"
+        let homebrewPrefixes = Set(["/opt/homebrew/", "/usr/local/Cellar/", "/usr/local/opt/"] + (ProcessInfo.processInfo.environment["HOMEBREW_PREFIX"].map { [$0.hasSuffix("/") ? $0 : $0 + "/"] } ?? []))
         var bundledLibraries: [String] = []
         var homebrewLoaded = false
         for index in 0..<_dyld_image_count() {
             guard let name = _dyld_get_image_name(index) else { continue }
             let path = String(cString: name)
             if path.hasPrefix(frameworkRoot) { bundledLibraries.append(URL(fileURLWithPath: path).lastPathComponent) }
-            if path.hasPrefix("/opt/homebrew/") { homebrewLoaded = true }
+            if homebrewPrefixes.contains(where: { path.hasPrefix($0) }) { homebrewLoaded = true }
         }
         report["bundled_libraries"] = bundledLibraries.sorted()
         report["homebrew_libraries_loaded"] = homebrewLoaded

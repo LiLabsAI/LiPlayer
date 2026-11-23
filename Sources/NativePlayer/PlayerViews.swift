@@ -24,6 +24,12 @@ struct PlayerRootView: View {
     @Bindable var session: PlayerSession
     @State private var jumpText = ""
     @State private var jumpError: String?
+    @State private var isDropTargeted = false
+    @FocusState private var jumpFocused: Bool
+    private var fullscreenTopPadding: CGFloat {
+        let notch = session.window?.screen?.safeAreaInsets.top ?? 0
+        return notch > 0 ? notch + 10 : 28
+    }
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
@@ -42,7 +48,7 @@ struct PlayerRootView: View {
                                 Text("LiPlayer").font(.system(size: 26, weight: .semibold)).foregroundStyle(.white)
                                 Text("Drop a video here, or choose a file.").font(.system(size: 14)).foregroundStyle(.gray)
                             }
-                            Button("Open File…") { session.perform(.open) }.controlSize(.large).keyboardShortcut("o", modifiers: .command)
+                            Button("Open File…") { session.perform(.open) }.controlSize(.large)
                             Button("Open Folder…") { session.perform(.openFolder) }.controlSize(.large)
                             if !session.history.isEmpty {
                                 Menu("Open Recent") { ForEach(session.history.prefix(8)) { record in Button(record.url.lastPathComponent) { session.openRecent(record) } } }
@@ -57,15 +63,38 @@ struct PlayerRootView: View {
                             if session.phase != "Opening…" { Button("Play Again") { session.togglePause() } }
                         }.padding(24)
                     }
+                    if let hud = session.hudMessage {
+                        VStack {
+                            Text(hud)
+                                .font(.system(size: 13, weight: .medium)).monospacedDigit()
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14).padding(.vertical, 7)
+                                .background(.black.opacity(0.72), in: Capsule())
+                                .overlay(Capsule().stroke(.white.opacity(0.14), lineWidth: 0.5))
+                                .padding(.top, session.fullscreen.active ? session.fullscreen.topHeight + 14 : 18)
+                            Spacer()
+                        }.allowsHitTesting(false).transition(.opacity)
+                    }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
                 if session.showQueue && !session.fullscreen.active { Divider(); QueueView(session: session).frame(width: 255) }
                 else if session.showInspector && !session.fullscreen.active { Divider(); InspectorView(session: session).frame(width: 292) }
             }
             if !session.fullscreen.active { Divider(); bottomChrome }
         }
+        .overlay {
+            if isDropTargeted {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10).stroke(Color.accentColor.opacity(0.85), lineWidth: 3).padding(8)
+                    Text("Drop media, subtitles, or folders to open")
+                        .font(.system(size: 14, weight: .medium)).foregroundStyle(.white)
+                        .padding(.horizontal, 18).padding(.vertical, 10)
+                        .background(.black.opacity(0.78), in: Capsule())
+                }.allowsHitTesting(false)
+            }
+        }
         .overlay(alignment: .top) {
             if session.fullscreen.active {
-                FullscreenHeader(session: session).padding(.top, 48)
+                FullscreenHeader(session: session).padding(.top, fullscreenTopPadding)
                     .environment(\.colorScheme, .dark)
                     .opacity(session.fullscreen.visible ? 1 : 0)
                     .allowsHitTesting(session.fullscreen.visible).accessibilityHidden(!session.fullscreen.visible)
@@ -82,16 +111,24 @@ struct PlayerRootView: View {
         }
         .overlay(alignment: .leading) {
             if session.fullscreen.active && session.showLibrary {
-                LibraryView(session: session).frame(width: 260).padding(.top, session.fullscreen.topHeight).padding(.bottom, session.fullscreen.bottomHeight).environment(\.colorScheme, .dark)
+                HStack(spacing: 0) { LibraryView(session: session).frame(width: 260); Divider() }
+                    .padding(.top, session.fullscreen.topHeight).padding(.bottom, session.fullscreen.bottomHeight)
+                    .shadow(color: .black.opacity(0.45), radius: 12)
+                    .environment(\.colorScheme, .dark)
             }
         }
         .overlay(alignment: .trailing) {
             if session.fullscreen.active && (session.showQueue || session.showInspector) {
-                Group { if session.showQueue { QueueView(session: session) } else { InspectorView(session: session) } }
-                    .frame(width: 292).padding(.top, session.fullscreen.topHeight).padding(.bottom, session.fullscreen.bottomHeight).environment(\.colorScheme, .dark)
+                HStack(spacing: 0) {
+                    Divider()
+                    Group { if session.showQueue { QueueView(session: session) } else { InspectorView(session: session) } }.frame(width: 292)
+                }
+                .padding(.top, session.fullscreen.topHeight).padding(.bottom, session.fullscreen.bottomHeight)
+                .shadow(color: .black.opacity(0.45), radius: 12)
+                .environment(\.colorScheme, .dark)
             }
         }
-        .onDrop(of: [.fileURL, .url], isTargeted: nil) { providers in
+        .onDrop(of: [.fileURL, .url], isTargeted: $isDropTargeted) { providers in
             let group = DispatchGroup()
             let collector = DropCollector()
             for (index, provider) in providers.enumerated() {
@@ -108,10 +145,10 @@ struct PlayerRootView: View {
         .sheet(isPresented: $session.showJump) {
             VStack(alignment: .leading, spacing: 18) {
                 Text("Go to Time").font(.headline)
-                TextField("Minutes:seconds or hours:minutes:seconds", text: $jumpText).textFieldStyle(.roundedBorder).onSubmit(jump)
+                TextField("Minutes:seconds or hours:minutes:seconds", text: $jumpText).textFieldStyle(.roundedBorder).focused($jumpFocused).onSubmit(jump)
                 if let jumpError { Text(jumpError).foregroundStyle(.red).font(.caption) }
                 HStack { Button("Cancel") { session.showJump = false }.keyboardShortcut(.cancelAction); Spacer(); Button("Go", action: jump).keyboardShortcut(.defaultAction) }
-            }.padding(24).frame(width: 370)
+            }.padding(24).frame(width: 370).onAppear { jumpText = ""; jumpError = nil; jumpFocused = true }
         }
     }
     @ViewBuilder private var bottomChrome: some View {
@@ -151,37 +188,93 @@ struct TransportView: View {
     var session: PlayerSession
     @State private var scrubPosition = 0.0
     @State private var scrubbing = false
+    @State private var pendingSeekTarget: Double?
+    @State private var seekReleaseTask: Task<Void, Never>?
+    private var displayedPosition: Double {
+        if scrubbing { return scrubPosition }
+        if let pendingSeekTarget { return pendingSeekTarget }
+        return min(session.position, max(session.duration, 1))
+    }
     var body: some View {
         VStack(spacing: 10) {
             HStack(spacing: 12) {
-                Text(TimeText.string(scrubbing ? scrubPosition : session.position)).monospacedDigit().frame(width: 62, alignment: .leading)
-                Slider(value: Binding(get: { scrubbing ? scrubPosition : min(session.position, max(session.duration, 1)) }, set: { scrubPosition = $0; if !scrubbing { session.seek($0) } }), in: 0...max(session.duration, 1), onEditingChanged: { editing in
-                    if editing { scrubbing = true }
-                    else { session.seek(scrubPosition); scrubbing = false }
+                Text(TimeText.string(displayedPosition)).monospacedDigit().frame(minWidth: 58, alignment: .leading).fixedSize()
+                Slider(value: Binding(get: { displayedPosition }, set: { newValue in
+                    scrubPosition = newValue
+                    if !scrubbing { commitSeek(to: newValue) }
+                }), in: 0...max(session.duration, 1), onEditingChanged: { editing in
+                    if editing {
+                        seekReleaseTask?.cancel()
+                        pendingSeekTarget = nil
+                        scrubbing = true
+                    } else {
+                        scrubbing = false
+                        commitSeek(to: scrubPosition)
+                    }
                     session.fullscreen.setScrubbing(editing)
                 }).disabled(!session.loaded || !session.seekable).accessibilityLabel("Playback position").accessibilityValue("\(TimeText.string(session.position)) of \(TimeText.string(session.duration))")
-                Text(session.duration > 0 ? "−" + TimeText.string(max(0, session.duration - (scrubbing ? scrubPosition : session.position))) : "—:—").monospacedDigit().frame(width: 70, alignment: .trailing)
+                Text(session.duration > 0 ? "−" + TimeText.string(max(0, session.duration - displayedPosition)) : "—:—").monospacedDigit().frame(minWidth: 66, alignment: .trailing).fixedSize()
             }.font(.system(size: 12)).foregroundStyle(.secondary)
-            GeometryReader { geometry in HStack(spacing: 14) {
-                Button { session.perform(.mute) } label: { Image(systemName: session.muted || session.volume == 0 ? "speaker.slash" : "speaker.wave.2") }.buttonStyle(.plain).frame(width: 22).help("Mute (M)").accessibilityLabel(session.muted ? "Unmute" : "Mute")
-                if geometry.size.width > 600 { Slider(value: Binding(get: { session.volume }, set: { session.set("volume", $0) }), in: 0...100).frame(width: 86).accessibilityLabel("Volume") }
-                Spacer(minLength: 12)
-                if geometry.size.width > 600 { control(.previous, "backward.end") }
+            GeometryReader { geometry in HStack(spacing: 12) {
+                Button { session.perform(.mute) } label: { Image(systemName: session.muted || session.volume == 0 ? "speaker.slash" : "speaker.wave.2") }
+                    .buttonStyle(.plain).frame(width: 22)
+                    .help(shortcutHelp(.mute))
+                    .accessibilityLabel(session.muted ? "Unmute" : "Mute")
+                if geometry.size.width > 430 {
+                    Slider(value: Binding(get: { session.volume }, set: { session.set("volume", $0) }), in: 0...100)
+                        .frame(width: geometry.size.width > 600 ? 86 : 64)
+                        .accessibilityLabel("Volume")
+                }
+                Spacer(minLength: 8)
+                if geometry.size.width > 520 { control(.previous, "backward.end") }
                 control(.backward, "gobackward")
-                Button { session.perform(.togglePause) } label: { Image(systemName: session.playing ? "pause.fill" : "play.fill").font(.system(size: 21, weight: .medium)).frame(width: 38, height: 30) }.buttonStyle(.plain).help("Play / Pause (Space)").accessibilityLabel(session.playing ? "Pause" : "Play")
+                Button { session.perform(.togglePause) } label: { Image(systemName: session.playing ? "pause.fill" : "play.fill").font(.system(size: 21, weight: .medium)).frame(width: 38, height: 30) }
+                    .buttonStyle(.plain)
+                    .disabled(!session.canPerform(.togglePause))
+                    .help(shortcutHelp(.togglePause))
+                    .accessibilityLabel(session.playing ? "Pause" : "Play")
                 control(.forward, "goforward")
-                if geometry.size.width > 600 { control(.next, "forward.end") }
-                Spacer(minLength: 12)
+                if geometry.size.width > 520 { control(.next, "forward.end") }
+                Spacer(minLength: 8)
                 Menu {
-                    ForEach([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 3, 4], id: \.self) { speed in Button(String(format: "%g×", speed)) { session.set("speed", speed) } }
-                } label: { Text(String(format: "%g×", session.speed)).monospacedDigit().frame(width: 38) }.menuStyle(.borderlessButton).fixedSize().disabled(!session.loaded).accessibilityLabel("Playback speed")
-                control(.fullscreen, "arrow.up.left.and.arrow.down.right")
+                    ForEach([0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 3, 4], id: \.self) { speed in Button(String(format: "%g×", speed)) { session.set("speed", speed) } }
+                } label: { Text(String(format: "%g×", session.speed)).monospacedDigit().frame(minWidth: 44).fixedSize() }.menuStyle(.borderlessButton).fixedSize().disabled(!session.loaded).accessibilityLabel("Playback speed")
+                control(.fullscreen, session.fullscreen.active ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }.font(.system(size: 14)).foregroundStyle(.primary) }.frame(height: 30)
         }.padding(.horizontal, 20).padding(.vertical, 13).background(.bar)
-            .onChange(of: session.position) { _, value in if !scrubbing { scrubPosition = value } }
+            .onChange(of: session.position) { _, value in
+                if !scrubbing {
+                    if let target = pendingSeekTarget, abs(value - target) < 0.6 {
+                        pendingSeekTarget = nil
+                        seekReleaseTask?.cancel()
+                    }
+                    if pendingSeekTarget == nil { scrubPosition = value }
+                }
+            }
+            .onChange(of: session.currentItem?.id) { _, _ in
+                pendingSeekTarget = nil; seekReleaseTask?.cancel()
+            }
+    }
+    private func commitSeek(to value: Double) {
+        pendingSeekTarget = value
+        session.seek(value)
+        seekReleaseTask?.cancel()
+        seekReleaseTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(650))
+            guard !Task.isCancelled else { return }
+            pendingSeekTarget = nil
+        }
+    }
+    private func shortcutHelp(_ command: PlayerCommand) -> String {
+        let key = session.shortcut(command)
+        return key.isEmpty ? command.title : "\(command.title)  \(key)"
     }
     private func control(_ command: PlayerCommand, _ symbol: String) -> some View {
-        Button { session.perform(command) } label: { Image(systemName: symbol).frame(width: 24, height: 28) }.buttonStyle(.plain).help("\(command.title)  \(session.shortcut(command))").accessibilityLabel(command.title)
+        Button { session.perform(command) } label: { Image(systemName: symbol).frame(width: 24, height: 28) }
+            .buttonStyle(.plain)
+            .disabled(!session.canPerform(command))
+            .help(shortcutHelp(command))
+            .accessibilityLabel(command.title)
     }
 }
 
@@ -189,7 +282,9 @@ private struct FullscreenHeader: View {
     var session: PlayerSession
     var body: some View {
         HStack(spacing: 20) {
-            Button { session.perform(.fullscreen) } label: { Image(systemName: "arrow.down.right.and.arrow.up.left") }.help("Exit full screen (Esc)").accessibilityLabel("Exit Full Screen")
+            Button { session.perform(.fullscreen) } label: { Image(systemName: "arrow.down.right.and.arrow.up.left") }
+                .help(session.shortcut(.fullscreen).isEmpty ? "Exit Full Screen" : "Exit Full Screen  \(session.shortcut(.fullscreen)) / Esc")
+                .accessibilityLabel("Exit Full Screen")
             Text(session.currentItem?.title ?? "LiPlayer").font(.system(size: 13, weight: .medium)).lineLimit(1)
             Spacer()
             button(.toggleLibrary, "sidebar.left")
@@ -198,24 +293,50 @@ private struct FullscreenHeader: View {
         }.font(.system(size: 14)).buttonStyle(.plain).padding(.horizontal, 24).padding(.vertical, 14).background(.bar)
     }
     private func button(_ command: PlayerCommand, _ symbol: String) -> some View {
-        Button { session.perform(command) } label: { Image(systemName: symbol).frame(width: 24, height: 24) }.help(command.title).accessibilityLabel(command.title)
+        let key = session.shortcut(command)
+        return Button { session.perform(command) } label: { Image(systemName: symbol).frame(width: 24, height: 24) }
+            .help(key.isEmpty ? command.title : "\(command.title)  \(key)")
+            .accessibilityLabel(command.title)
     }
 }
 
 struct QueueView: View {
     @Bindable var session: PlayerSession
+    @State private var filterText = ""
+    private var displayedItems: [MediaItem] {
+        let query = filterText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return session.queue.items }
+        return session.queue.items.filter { $0.title.localizedCaseInsensitiveContains(query) }
+    }
     var body: some View {
         VStack(spacing: 0) {
-            HStack { Text("Queue").font(.headline); Text("\(session.queue.items.count)").foregroundStyle(.secondary); Spacer(); Menu { Button("Add Files…") { session.openPanel(append: true) }; Button("Save Queue…") { session.saveQueue() } } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Queue actions") }.padding(16)
+            HStack {
+                Text("Queue").font(.headline)
+                Text("\(session.queue.items.count)").foregroundStyle(.secondary)
+                Spacer()
+                Menu {
+                    Button("Add Files…") { session.openPanel(append: true) }
+                    Button("Save Queue…") { session.saveQueue() }.disabled(session.queue.items.isEmpty)
+                    Divider()
+                    Button("Clear Queue", role: .destructive) { session.clearQueue() }.disabled(session.queue.items.isEmpty)
+                } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Queue actions")
+            }.padding(16)
+            if session.queue.items.count > 5 || !filterText.isEmpty {
+                TextField("Filter queue", text: $filterText).textFieldStyle(.roundedBorder).font(.system(size: 12)).padding(.horizontal, 12).padding(.bottom, 10)
+            }
             Divider()
             if session.queue.items.isEmpty { Text("Add files to start a queue.").font(.system(size: 12)).foregroundStyle(.secondary).padding(20); Spacer() }
+            else if displayedItems.isEmpty { Text("No matching items.").font(.system(size: 12)).foregroundStyle(.secondary).padding(20); Spacer() }
             else {
                 List {
-                    ForEach(session.queue.items) { item in
+                    ForEach(displayedItems) { item in
                         Button { session.select(item) } label: {
                             HStack(alignment: .top, spacing: 10) {
                                 Image(systemName: item.id == session.currentItem?.id ? "play.fill" : "film").font(.system(size: 12)).foregroundStyle(item.id == session.currentItem?.id ? .primary : .secondary).frame(width: 15)
-                                VStack(alignment: .leading, spacing: 4) { Text(item.title).font(.system(size: 13, weight: item.id == session.currentItem?.id ? .medium : .regular)).lineLimit(2); Text(item.url.isFileURL ? item.url.deletingLastPathComponent().lastPathComponent : item.url.host ?? "Stream").font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1) }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(item.title).font(.system(size: 13, weight: item.id == session.currentItem?.id ? .medium : .regular)).lineLimit(2)
+                                    Text(item.url.isFileURL ? item.url.deletingLastPathComponent().lastPathComponent : (item.url.host ?? "Stream")).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
+                                }
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 5).contentShape(Rectangle())
                         }.buttonStyle(.plain)
                         .contextMenu {
@@ -226,6 +347,7 @@ struct QueueView: View {
                             Divider(); Button("Remove from Queue") { session.remove(item) }
                         }
                     }
+                    .onMove(perform: filterText.isEmpty ? { session.moveQueueItems(fromOffsets: $0, toOffset: $1) } : nil)
                 }.listStyle(.sidebar)
             }
             Divider()
@@ -241,13 +363,22 @@ struct CommandSearchView: View {
     private var filtered: [PlayerCommand] { PlayerCommand.allCases.filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) } }
     var body: some View {
         VStack(spacing: 0) {
-            TextField("Find a playback command…", text: $query).textFieldStyle(.plain).font(.system(size: 17)).padding(20).focused($focused).onSubmit { if let command = filtered.first { run(command) } }
+            TextField("Find a playback command…", text: $query).textFieldStyle(.plain).font(.system(size: 17)).padding(20).focused($focused).onSubmit {
+                if let command = filtered.first(where: { session.canPerform($0) }) { run(command) }
+            }
             Divider()
             List(filtered) { command in
-                Button { run(command) } label: { HStack { Text(command.title); Spacer(); Text(session.shortcut(command)).font(.system(size: 12)).foregroundStyle(.secondary) }.padding(.vertical, 5).contentShape(Rectangle()) }.buttonStyle(.plain)
+                let enabled = session.canPerform(command)
+                Button { run(command) } label: {
+                    HStack {
+                        Text(command.title).foregroundStyle(enabled ? .primary : .tertiary)
+                        Spacer()
+                        Text(session.shortcut(command)).font(.system(size: 12)).foregroundStyle(.secondary)
+                    }.padding(.vertical, 5).contentShape(Rectangle())
+                }.buttonStyle(.plain).disabled(!enabled)
             }.listStyle(.plain)
             Divider()
-            HStack { Text("Return runs the first result.").font(.system(size: 12)).foregroundStyle(.secondary); Spacer(); Button("Close") { session.showCommands = false }.keyboardShortcut(.cancelAction) }.padding(14)
+            HStack { Text("Return runs the first available result.").font(.system(size: 12)).foregroundStyle(.secondary); Spacer(); Button("Close") { session.showCommands = false }.keyboardShortcut(.cancelAction) }.padding(14)
         }.frame(width: 480, height: 460).onAppear { focused = true }
     }
     private func run(_ command: PlayerCommand) { session.showCommands = false; session.perform(command) }
