@@ -13,7 +13,7 @@ The current bundle targets **Apple Silicon running macOS 27.2 or later**, matchi
 
 ## Use the app
 
-Download the Apple Silicon app from [GitHub Releases](https://github.com/LiLabsAI/LiPlayer/releases/latest) or build `LiPlayer.app` from source below, and move it into Applications. Open a file with ⌘O or open a persistent folder Library with ⌘⇧O. Show/hide Library with ⌘⇧L. Quit earlier builds before opening another copy.
+Download the Apple Silicon app from [GitHub Releases](https://github.com/aliahadmd/LiPlayer/releases/latest) or build `LiPlayer.app` from source below, and move it into Applications. Open a file with ⌘O or open a persistent folder Library with ⌘⇧O. Show/hide Library with ⌘⇧L. Quit earlier builds before opening another copy.
 
 **Signing:** this build is ad hoc signed and is not notarized. macOS may block a downloaded copy. A Developer ID signed release is future work; building from source is available below. No automatic updater is included.
 
@@ -67,11 +67,11 @@ Research downloads, proprietary resources, dependency binaries, and build output
 
 ## Contributing & License
 
-Copyright © 2026 [Ali Ahad](https://aliahad.com) · [LI Labs](https://github.com/LiLabsAI).
+Copyright © 2026 [Ali Ahad](https://aliahad.com).
 
 LiPlayer's original application code and brand assets are free, open-source software licensed under the **GNU General Public License v3.0 (`GPL-3.0-or-later`)** — see [LICENSE](LICENSE).
 
 - **Copyleft protection:** Any distributed fork, modification, or derivative work incorporating LiPlayer's code must also remain open source under GPLv3 with complete corresponding source code provided; this codebase may not be incorporated into distributed closed-source or proprietary software.
 - **Ownership & attribution:** Original copyright notices (`Copyright (C) 2026 Ali Ahad`), [NOTICE.md](NOTICE.md), and source-file license headers must be preserved across forks and redistributions.
-- **Forks & community contributions:** Developers are welcome to study, modify, fork, report issues, and submit pull requests on [GitHub](https://github.com/LiLabsAI/LiPlayer) — see [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- **Forks & community contributions:** Developers are welcome to study, modify, fork, report issues, and submit pull requests on [GitHub](https://github.com/aliahadmd/LiPlayer) — see [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 - **Third-party dependencies:** Bundled libraries retain their own licenses. Notices, checksums, and recipes are bundled in `Contents/Resources/Licenses`; upstream source archives and build resources are attached alongside releases. See [NOTICE.md](NOTICE.md) and [ThirdParty/README.md](ThirdParty/README.md) for source availability and rebuilding. Packaging scripts do not publish automatically.

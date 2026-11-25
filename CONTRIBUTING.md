@@ -2,11 +2,11 @@
 
 Thank you for your interest in contributing to **LiPlayer**!
 
-LiPlayer is free, open-source software created by [Ali Ahad](https://aliahad.com) under [LI Labs](https://github.com/LiLabsAI), licensed under the **GNU General Public License v3.0 (`GPL-3.0-or-later`)** — see [LICENSE](LICENSE).
+LiPlayer is free, open-source software created by [Ali Ahad](https://aliahad.com), licensed under the **GNU General Public License v3.0 (`GPL-3.0-or-later`)** — see [LICENSE](LICENSE).
 
 ## Ways to contribute
 
-- **Report bugs:** Open an issue on [GitHub Issues](https://github.com/LiLabsAI/LiPlayer/issues) with reproduction steps, sample media details (codec/container), your macOS version, and app version.
+- **Report bugs:** Open an issue on [GitHub Issues](https://github.com/aliahadmd/LiPlayer/issues) with reproduction steps, sample media details (codec/container), your macOS version, and app version.
 - **Suggest features & enhancements:** Open a feature request describing the use case and expected playback/library behavior.
 - **Fork & submit pull requests:** Fork the repository on GitHub, create a focused branch from `main`, keep changes well-tested, and open a pull request explaining the motivation and verification you ran.
 

@@ -1,6 +1,6 @@
 # Copyright & Third-Party Notices
 
-Copyright (C) 2026 [Ali Ahad](https://aliahad.com) · [LI Labs](https://github.com/LiLabsAI).
+Copyright (C) 2026 [Ali Ahad](https://aliahad.com).
 
 LiPlayer (formerly Video Player) is an original Swift/AppKit/SwiftUI application and brand asset set licensed under the **GNU General Public License v3.0 (`GPL-3.0-or-later`)**. See [LICENSE](LICENSE). Under the GPLv3, you are free to study, use, modify, fork, and distribute the software, provided that all copies and distributed derivative works remain licensed under GPLv3 with complete corresponding source code and original copyright and attribution notices preserved.
 

@@ -53,7 +53,7 @@ info = {
     'LSMinimumSystemVersion': '27.2', 'NSHighResolutionCapable': True,
     'NSPrincipalClass': 'NSApplication', 'LSApplicationCategoryType': 'public.app-category.video',
     'CFBundleIconFile': 'AppIcon',
-    'NSHumanReadableCopyright': 'Copyright © 2026 Ali Ahad · LI Labs. Licensed under GPLv3. Third-party notices included.',
+    'NSHumanReadableCopyright': 'Copyright © 2026 Ali Ahad. Licensed under GPLv3. Third-party notices included.',
     'UTExportedTypeDeclarations': [{'UTTypeIdentifier': 'com.aliahad.liplayer.queue', 'UTTypeDescription': 'LiPlayer Queue', 'UTTypeConformsTo': ['public.json'], 'UTTypeIconFile': 'LiPlayerQueue', 'UTTypeTagSpecification': {'public.filename-extension': ['lpqueue']}}],
     'UTImportedTypeDeclarations': [{'UTTypeIdentifier': 'com.aliahad.videoplayer.queue', 'UTTypeDescription': 'Legacy Video Player Queue', 'UTTypeConformsTo': ['public.json'], 'UTTypeIconFile': 'LiPlayerQueue', 'UTTypeTagSpecification': {'public.filename-extension': ['vpqueue']}}],
     'CFBundleDocumentTypes': [

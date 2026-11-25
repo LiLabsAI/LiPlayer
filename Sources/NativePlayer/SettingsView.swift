@@ -109,12 +109,12 @@ struct SettingsView: View {
                 }
                 Divider()
                 Text("Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development") · Apple Silicon · macOS \(minimumMacOS) or later")
-                Text("Copyright © 2026 Ali Ahad · LI Labs. Built with Swift, AppKit, SwiftUI, libmpv, FFmpeg and libass.").font(.system(size: 13)).foregroundStyle(.secondary)
+                Text("Copyright © 2026 Ali Ahad. Built with Swift, AppKit, SwiftUI, libmpv, FFmpeg and libass.").font(.system(size: 13)).foregroundStyle(.secondary)
                 Text("Licensed under the GNU General Public License v3.0 (GPLv3). Distributed derivatives must remain open source under GPLv3 with attribution preserved. Native dependency notices and source locations are bundled with the app.").font(.system(size: 12)).foregroundStyle(.secondary)
                 Text("Video presentation uses OpenGL. HDR input is tone mapped to SDR; native HDR presentation and system Picture in Picture are not advertised in this version.").font(.system(size: 12)).foregroundStyle(.secondary)
                 HStack(spacing: 12) {
                     Button("Open Dependency Notices") { if let url = Bundle.main.resourceURL?.appendingPathComponent("Licenses") { NSWorkspace.shared.open(url) } }
-                    if let repoURL = URL(string: "https://github.com/LiLabsAI/LiPlayer") {
+                    if let repoURL = URL(string: "https://github.com/aliahadmd/LiPlayer") {
                         Link("Source & License on GitHub", destination: repoURL)
                     }
                 }
